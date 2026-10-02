@@ -69,6 +69,8 @@ pub enum Action {
     Todo { text: String },
     ShowSchedule { what: String },
     CancelSchedule { what: String },
+    /// Delete everything of one kind, or the whole schedule.
+    ClearSchedule { what: String },
     CompleteTodo { what: String },
 }
 
@@ -86,6 +88,7 @@ impl Action {
                 | Action::Todo { .. }
                 | Action::ShowSchedule { .. }
                 | Action::CancelSchedule { .. }
+                | Action::ClearSchedule { .. }
                 | Action::CompleteTodo { .. }
         )
     }
@@ -111,7 +114,10 @@ impl Action {
             Action::Reminder { .. } => "the reminder".into(),
             Action::CalendarEvent { .. } => "the event".into(),
             Action::Todo { .. } => "the to-do".into(),
-            Action::ShowSchedule { .. } | Action::CancelSchedule { .. } | Action::CompleteTodo { .. } => {
+            Action::ShowSchedule { .. }
+            | Action::CancelSchedule { .. }
+            | Action::ClearSchedule { .. }
+            | Action::CompleteTodo { .. } => {
                 "the schedule".into()
             }
             Action::Custom { name, .. } => name.replace('_', " "),
@@ -147,6 +153,7 @@ impl std::fmt::Display for Action {
             Action::Todo { text } => write!(f, "add {text:?} to the list"),
             Action::ShowSchedule { what } => write!(f, "read the schedule ({what:?})"),
             Action::CancelSchedule { what } => write!(f, "cancel {what:?}"),
+            Action::ClearSchedule { what } => write!(f, "clear {what:?}"),
             Action::CompleteTodo { what } => write!(f, "tick off {what:?}"),
             Action::Custom { name, params } => {
                 let args: Vec<String> = params.iter().map(|(k, v)| format!("{k}={v:?}")).collect();
@@ -227,6 +234,19 @@ impl Brain {
             }
         };
         self.last_used = Instant::now();
+        // A command to *do* something must not become a search for the sentence
+        // itself. "delete all my alarms" had no matching function, and the
+        // answer was a web search for those exact words, which is worse than
+        // admitting it did not understand.
+        let actions = if actions.iter().any(|a| matches!(a, Action::WebSearch(_)))
+            && looks_like_a_command(&command)
+            && !is_a_search_request(&command)
+        {
+            log::info!("not searching for what looks like a command: {command:?}");
+            Vec::new()
+        } else {
+            actions
+        };
         if actions.is_empty() {
             return Decision {
                 actions: vec![Action::WebSearch(command)],
@@ -309,6 +329,7 @@ pub fn action_from_call(name: &str, args: &Value, cfg: &Config) -> Option<Action
         "add_todo" => Some(Action::Todo { text: arg("text").unwrap_or_default() }),
         "show_schedule" => Some(Action::ShowSchedule { what: arg("what").unwrap_or_default() }),
         "cancel_schedule" => Some(Action::CancelSchedule { what: arg("what").unwrap_or_default() }),
+        "clear_schedule" => Some(Action::ClearSchedule { what: arg("what").unwrap_or_default() }),
         "complete_todo" => {
             Some(Action::CompleteTodo { what: arg("what").unwrap_or_else(|| arg("text").unwrap_or_default()) })
         }
@@ -521,15 +542,58 @@ fn asks_to_wait(text: &str, cfg: &Config) -> bool {
     anchored
 }
 
+/// Verbs that mean "do something", not "look something up".
+const IMPERATIVES: &[&str] = &[
+    "delete", "remove", "clear", "cancel", "erase", "wipe", "add", "set", "create", "make", "put", "start",
+    "stop", "turn", "shut", "open", "close", "launch", "quit", "exit", "play", "pause", "resume", "skip",
+    "mute", "unmute", "remind", "schedule", "lock", "screenshot", "increase", "decrease", "lower", "raise",
+    "disengage", "forget", "empty", "dump", "throw", "get rid", "swap", "change", "switch", "enable",
+    "disable", "block", "unblock", "send", "call", "text", "email", "print", "copy", "move", "rename",
+];
+
+/// Does this read as an instruction rather than a question?
+#[cfg(test)]
+fn clean(s: &str) -> String {
+    s.trim().trim_end_matches('.').to_lowercase()
+}
+
+fn looks_like_a_command(text: &str) -> bool {
+    text.split(' ')
+        .find(|w| !w.is_empty())
+        .is_some_and(|first| IMPERATIVES.contains(&first) || IMPERATIVES.iter().any(|v| first.starts_with(v)))
+}
+
+/// "search for X" and "what is X" are searches however they start.
+fn is_a_search_request(text: &str) -> bool {
+    const ASKS: &[&str] = &[
+        "search", "google", "look up", "lookup", "find out", "what", "who", "when", "where", "why", "how",
+        "which", "is", "are", "does", "do", "can", "could", "define", "meaning", "tell me about", "news",
+    ];
+    ASKS.iter().any(|a| text.starts_with(a) || text.contains(&format!(" {a} ")))
+}
+
 const TIME_ANCHORS: &[&str] = &["time", "clock", "oclock"];
 const DATE_ANCHORS: &[&str] = &["date", "day", "today", "tonight"];
 
 /// A schedule question, as opposed to something being put *on* the schedule.
+///
+/// Deliberately lenient about the wording — "word on my alarm" is a mangled
+/// "what is on my alarm" and should still be answered — but it must not swallow
+/// an entry: "reminder to call my mum at four" reads like an instruction, and
+/// the phrase list above claims that one before this rule is even reached.
 fn asks_about_schedule(text: &str) -> bool {
     const KEYWORDS: [&str; 7] = ["schedule", "calendar", "alarm", "reminder", "to do list", "todo list", "to do"];
-    const VERBS: [&str; 12] = [
+    const VERBS: [&str; 14] = [
         "set", "add", "put", "remind", "cancel", "delete", "remove", "mark", "complete", "finish", "done", "make",
+        "create", "clear",
     ];
+    /// "reminder to X", "alarm for 7" — an entry being dictated, not a question.
+    const DICTATING: [&str; 8] = [
+        "reminder to", "reminder for", "reminder at", "alarm for", "alarm to", "alarm at", "todo to", "event for",
+    ];
+    if DICTATING.iter().any(|p| text.starts_with(p)) {
+        return false;
+    }
     KEYWORDS.iter().any(|k| text.contains(k)) && !VERBS.iter().any(|v| text.split(' ').any(|w| w == *v))
 }
 
@@ -878,6 +942,31 @@ mod tests {
 
     /// Backing out after the wake word, in the words people actually use.
     #[test]
+    fn a_command_is_never_a_search() {
+        // Whatever the model answers, these must not turn into a web search.
+        for said in [
+            "delete all my alarms",
+            "cancel my meeting",
+            "empty the bin",
+            "turn the volume down",
+            "remind me to breathe",
+        ] {
+            assert!(looks_like_a_command(&clean(&said)), "{said:?} should read as a command");
+        }
+        // Questions and explicit searches still are searches.
+        for said in [
+            "what is the haber process",
+            "who won the world cup",
+            "search for a new laptop",
+            "google how to fix a leaking tap",
+            "look up the weather tomorrow",
+            "is it going to rain",
+        ] {
+            assert!(is_a_search_request(&clean(&said)), "{said:?} should still be allowed to search");
+        }
+    }
+
+    #[test]
     fn disengaging() {
         let mut cfg = Config::default();
         cfg.agent_name = "Reggie".into();
@@ -942,6 +1031,29 @@ mod tests {
         // A mangled question about the schedule still reads it out.
         let got = run("word on my alarm");
         assert!(format!("{got:?}").contains("ShowSchedule"), "{got:?}");
+    }
+
+    #[test]
+    fn a_reminder_is_set_not_read_out() {
+        let cfg = Config::default();
+        let apps = index();
+        let run = |c: &str| instant(&clean_command(c, &cfg), &cfg, &apps);
+        // This was answered by reading the schedule out loud.
+        for said in ["reminder to call my mum at four", "reminder to call my mum", "reminder for the dentist at 3 pm"] {
+            let got = run(said);
+            assert!(
+                !format!("{got:?}").contains("ShowSchedule"),
+                "{said:?} was treated as a question about the schedule: {got:?}"
+            );
+        }
+        // Questions still read it out, mangled or not.
+        for said in ["what is on my schedule", "word on my alarm", "list my reminders", "any reminders today"] {
+            let got = run(said);
+            assert!(
+                format!("{got:?}").contains("ShowSchedule"),
+                "{said:?} should read the schedule out: {got:?}"
+            );
+        }
     }
 
     #[test]

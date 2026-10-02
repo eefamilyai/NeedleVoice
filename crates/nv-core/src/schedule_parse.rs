@@ -529,6 +529,18 @@ mod tests {
     }
 
     #[test]
+    fn a_bare_hour_is_the_next_one() {
+        // "reminder to call mum at 4" captured "4" and it became 4 am tomorrow.
+        let at = |s: &str| parse(s, Stamp::new(2026, 10, 2, 13, 38)).unwrap().0;
+        assert_eq!(at("4").clock(), "16:00", "mid-afternoon, 4 means this afternoon");
+        assert_eq!(at("4").date(), "2026-10-02");
+        assert_eq!(at("9").clock(), "21:00", "9 am has gone, so 9 tonight");
+        // Late at night the only sensible four o'clock is tomorrow morning.
+        let late = parse("4", Stamp::new(2026, 10, 2, 22, 30)).unwrap().0;
+        assert_eq!((late.date().as_str(), late.clock().as_str()), ("2026-10-03", "04:00"));
+    }
+
+    #[test]
     fn time_only_matching() {
         assert_eq!(parse_time_only("cancel my 7am alarm"), Some((7, 0)));
         assert_eq!(parse_time_only("the 7 30 pm one"), Some((19, 30)));

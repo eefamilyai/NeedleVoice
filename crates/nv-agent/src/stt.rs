@@ -13,6 +13,7 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use nv_core::config::SttEngine;
+use nv_core::schedule::Stamp;
 use nv_core::Config;
 use sherpa_onnx::{OfflineMoonshineModelConfig, OfflineRecognizer, OfflineRecognizerConfig};
 use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters, WhisperState};
@@ -26,6 +27,8 @@ pub struct Stt {
     whisper: Option<(WhisperContext, WhisperState)>,
     /// Moonshine: sherpa's recogniser, which holds the whole model.
     moonshine: Option<OfflineRecognizer>,
+    /// Save each clip for later inspection.
+    save_clips: bool,
     last_used: Instant,
 }
 
@@ -66,6 +69,7 @@ impl Stt {
             prompt,
             whisper: None,
             moonshine: None,
+            save_clips: cfg.save_clips,
             last_used: Instant::now(),
         }
     }
@@ -80,6 +84,7 @@ impl Stt {
             prompt: String::new(),
             whisper: None,
             moonshine: None,
+            save_clips: false,
             last_used: Instant::now(),
         };
         stt.prompt = format!(
@@ -99,6 +104,7 @@ impl Stt {
             prompt: String::new(),
             whisper: None,
             moonshine: None,
+            save_clips: false,
             last_used: Instant::now(),
         }
     }
@@ -106,6 +112,22 @@ impl Stt {
     /// Which engine this instance actually ended up with.
     pub fn engine(&self) -> SttEngine {
         self.engine
+    }
+
+    /// Is the model in memory already?
+    pub fn loaded(&self) -> bool {
+        match self.engine {
+            SttEngine::Moonshine => self.moonshine.is_some(),
+            SttEngine::Whisper => self.whisper.is_some(),
+        }
+    }
+
+    /// Load the model now. Called when the wake word is heard, so the load
+    /// overlaps the sentence being spoken rather than delaying the answer.
+    pub fn prepare(&mut self) {
+        if let Err(e) = self.ensure() {
+            log::error!("{e}");
+        }
     }
 
     /// Load whatever is needed, if it is not loaded already.
@@ -176,11 +198,48 @@ impl Stt {
     /// Transcribe 16 kHz mono audio.
     pub fn transcribe(&mut self, audio: &[f32]) -> Result<String, String> {
         self.last_used = Instant::now();
+        // Loading is worth calling out separately: it is the difference between
+        // "instant" and "why is this slow", and it is invisible from the outside.
+        let load_started = Instant::now();
+        let cold = !self.loaded();
         self.ensure()?;
+        let load = load_started.elapsed();
+        let infer_started = Instant::now();
         let text = match self.engine {
             SttEngine::Moonshine => self.run_moonshine(audio)?,
             SttEngine::Whisper => self.run_whisper(audio)?,
         };
+        let infer = infer_started.elapsed();
+        // `NV_DUMP_AUDIO=<dir>` writes what the recogniser was given. Guessing
+        // at a mis-heard word is hopeless; having the clip is not.
+        let dump_dir = std::env::var("NV_DUMP_AUDIO").ok().map(std::path::PathBuf::from).or_else(|| {
+            self.save_clips.then(|| nv_core::paths::data_dir().join("clips"))
+        });
+        if let Some(dir) = dump_dir {
+            let dir = dir.display().to_string();
+            let peak = audio.iter().fold(0f32, |m, s| m.max(s.abs()));
+            let rms = (audio.iter().map(|s| s * s).sum::<f32>() / audio.len().max(1) as f32).sqrt();
+            let path = std::path::Path::new(&dir).join(format!(
+                "cmd-{}-{:.0}ms-peak{:.0}db.wav",
+                Stamp::now().clock().replace(':', ""),
+                audio.len() as f32 / crate::audio::RATE as f32 * 1000.0,
+                20.0 * peak.max(1e-9).log10()
+            ));
+            if std::fs::create_dir_all(&dir).is_ok() {
+                let _ = write_wav(&path, audio);
+                log::info!(
+                    "audio dumped to {} (peak {:.0} dBFS, rms {:.0} dBFS)",
+                    path.display(),
+                    20.0 * peak.max(1e-9).log10(),
+                    20.0 * rms.max(1e-9).log10()
+                );
+            }
+        }
+        if cold {
+            log::info!("{}: {:.0} ms infer + {:.0} ms load (cold)", self.engine.label(), infer.as_secs_f32() * 1000.0, load.as_secs_f32() * 1000.0);
+        } else {
+            log::info!("{}: {:.0} ms infer", self.engine.label(), infer.as_secs_f32() * 1000.0);
+        }
         self.last_used = Instant::now();
         Ok(clean(&text))
     }
@@ -189,11 +248,17 @@ impl Stt {
     fn run_moonshine(&mut self, audio: &[f32]) -> Result<String, String> {
         let recognizer = self.moonshine.as_ref().ok_or("Moonshine is not loaded")?;
         let stream = recognizer.create_stream();
-        // It needs a little more than half a second of audio to say anything.
-        let mut data = audio.to_vec();
-        if data.len() < crate::audio::RATE as usize / 2 {
-            data.resize(crate::audio::RATE as usize / 2, 0.0);
+        // Same levelling as Whisper gets: a soft first syllable on a quiet
+        // microphone is the most likely word to go missing, and this is the
+        // cheapest thing that helps it.
+        let mut data = normalize(audio);
+        // A little leading silence, and enough audio to be worth recognising.
+        let mut padded = vec![0.0f32; crate::audio::RATE as usize / 16];
+        padded.extend_from_slice(&data);
+        if padded.len() < crate::audio::RATE as usize / 2 {
+            padded.resize(crate::audio::RATE as usize / 2, 0.0);
         }
+        data = padded;
         stream.accept_waveform(crate::audio::RATE as i32, &data);
         recognizer.decode(&stream);
         let result = stream.get_result().ok_or("Moonshine returned nothing")?;
@@ -242,6 +307,30 @@ impl Stt {
         }
         Ok(text)
     }
+}
+
+/// Write 16 kHz mono f32 samples as a 16-bit WAV. Used by the dump above.
+fn write_wav(path: &std::path::Path, samples: &[f32]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut f = std::io::BufWriter::new(std::fs::File::create(path)?);
+    let data_len = (samples.len() * 2) as u32;
+    f.write_all(b"RIFF")?;
+    f.write_all(&(36 + data_len).to_le_bytes())?;
+    f.write_all(b"WAVEfmt ")?;
+    f.write_all(&16u32.to_le_bytes())?;
+    f.write_all(&1u16.to_le_bytes())?;
+    f.write_all(&1u16.to_le_bytes())?;
+    f.write_all(&crate::audio::RATE.to_le_bytes())?;
+    f.write_all(&(crate::audio::RATE * 2).to_le_bytes())?;
+    f.write_all(&2u16.to_le_bytes())?;
+    f.write_all(&16u16.to_le_bytes())?;
+    f.write_all(b"data")?;
+    f.write_all(&data_len.to_le_bytes())?;
+    for s in samples {
+        let v = (s.clamp(-1.0, 1.0) * 32767.0) as i16;
+        f.write_all(&v.to_le_bytes())?;
+    }
+    f.flush()
 }
 
 /// Drop Whisper's non-speech annotations like "[BLANK_AUDIO]" or "(music)".

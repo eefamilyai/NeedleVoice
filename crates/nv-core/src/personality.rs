@@ -315,7 +315,7 @@ pub fn line(persona: Persona, moment: &Moment) -> String {
             Action::Alarm { .. } | Action::Reminder { .. } | Action::CalendarEvent { .. } => "{x}.",
             Action::Todo { .. } => "{x}.",
             Action::ShowSchedule { .. } => "{x}.",
-            Action::CancelSchedule { .. } => "{x}.",
+            Action::CancelSchedule { .. } | Action::ClearSchedule { .. } => "{x}.",
             Action::CompleteTodo { .. } => "{x}.",
             Action::TellTime | Action::TellDate => "{x}.",
         },

@@ -628,6 +628,14 @@ impl App {
                     self.cfg.stt_engine = engine;
                 }
             });
+            ui::row(
+                ui,
+                "Save what it hears",
+                "Keeps every clip it recognised in the settings folder's clips\\ directory",
+                |ui| {
+                    ui::switch(ui, &mut self.cfg.save_clips, "");
+                },
+            );
             if self.cfg.stt_engine == SttEngine::Moonshine {
                 // English-only, and either on disk or one download away.
                 ui::row(ui, "Moonshine", "English only", |ui| {

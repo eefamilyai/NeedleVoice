@@ -492,6 +492,14 @@ impl Schedule {
         Some(self.items.remove(at))
     }
 
+    /// Throw away everything of one kind, or all of it. Returns what went, so
+    /// the reply can say what was removed.
+    pub fn clear(&mut self, kind: Option<ItemKind>) -> Vec<Item> {
+        let (gone, keep): (Vec<Item>, Vec<Item>) = self.items.drain(..).partition(|i| kind.is_none_or(|k| i.kind == k));
+        self.items = keep;
+        gone
+    }
+
     pub fn set_done(&mut self, id: u32, done: bool) -> Option<&Item> {
         let now = Stamp::now();
         let item = self.items.iter_mut().find(|i| i.id == id)?;
@@ -829,6 +837,20 @@ mod tests {
         assert_eq!(announcement(&reminder, now), "Reminder: take the pizza out.");
         let event = item(ItemKind::Event, "team lunch", stamp(2026, 10, 2, 12, 30), Repeat::Once);
         assert_eq!(announcement(&event, now), "Coming up at 12:30 pm: team lunch.");
+    }
+
+    #[test]
+    fn clearing_one_kind_leaves_the_rest() {
+        let mut s = Schedule::default();
+        s.add(Item { kind: ItemKind::Alarm, text: "wake up".into(), ..Default::default() });
+        s.add(Item { kind: ItemKind::Alarm, text: "meds".into(), ..Default::default() });
+        s.add(Item { kind: ItemKind::Todo, text: "buy milk".into(), ..Default::default() });
+        assert_eq!(s.clear(Some(ItemKind::Alarm)).len(), 2);
+        assert_eq!(s.items.len(), 1);
+        assert_eq!(s.items[0].kind, ItemKind::Todo);
+        // "Everything" means everything.
+        assert_eq!(s.clear(None).len(), 1);
+        assert!(s.items.is_empty());
     }
 
     #[test]

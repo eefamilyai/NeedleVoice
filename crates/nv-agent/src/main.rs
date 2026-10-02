@@ -58,8 +58,8 @@ fn main() {
                     .chunks_exact(2)
                     .map(|b| i16::from_le_bytes([b[0], b[1]]) as f32 / 32768.0)
                     .collect();
-                let models = nv_core::paths::models_dir();
                 let mut stt = stt::Stt::new(&cfg);
+                log::info!("transcribing with {}", stt.engine().label());
                 stt.transcribe(&audio).unwrap_or_else(|e| format!("ERROR: {e}"))
             }
             Err(e) => format!("ERROR: {e}"),

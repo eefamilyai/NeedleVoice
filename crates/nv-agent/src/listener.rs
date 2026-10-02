@@ -39,6 +39,8 @@ const KWS_RESET_AFTER_MS: u32 = 1200;
 /// segment. Kept under the preroll window below, which means anything spoken during it
 /// is still prepended to the command when speech is finally detected.
 const WAKE_SETTLE_MS: u64 = 400;
+/// The same window in frames.
+const WAKE_SETTLE_FRAMES: u32 = (WAKE_SETTLE_MS / FRAME_MS as u64) as u32;
 /// The settle window must fit inside the preroll, or the first words of the
 /// command after the name would be lost. Checked at compile time.
 const _: () = assert!(WAKE_SETTLE_MS <= PREROLL_FRAMES as u64 * FRAME_MS as u64);
@@ -74,7 +76,11 @@ impl Segment {
 
 pub fn run(cfg: Config, shared: Arc<Shared>, apps: Arc<RwLock<AppIndex>>, tts: Arc<Tts>, ctl: Receiver<Ctl>) {
     let models = nv_core::paths::models_dir();
-    let mut stt = Stt::new(&cfg);
+    let mut stt: Option<Stt> = Some(Stt::new(&cfg));
+    // Loading the recogniser takes a second or two, which is longer than the
+    // sentence being spoken. It runs on its own thread so the model is ready by
+    // the time the command ends, and so the microphone keeps being read.
+    let mut loading: Option<std::thread::JoinHandle<Stt>> = None;
     let mut brain = Brain::new(models.join(nv_core::NEEDLE_MODEL), cfg.needle_depth);
     if !brain.model_exists() {
         log::error!("Needle model missing at {}", models.display());
@@ -124,12 +130,18 @@ pub fn run(cfg: Config, shared: Arc<Shared>, apps: Arc<RwLock<AppIndex>>, tts: A
     // Frames of quiet fed to the spotter since it was last reset.
     let mut spotter_quiet_ms = 0u32;
     // Ignore the mic briefly after waking so the chime isn't taken as speech.
-    let mut deaf_until = Instant::now();
+    let mut deaf_frames: u32 = 0;
 
     log::info!("listening for \"{}\"", cfg.wake_phrase());
 
     loop {
         // ── control messages ───────────────────────────────────────────
+        if loading.as_ref().is_some_and(|h| h.is_finished()) {
+            let h = loading.take().unwrap();
+            if let Ok(s) = h.join() {
+                stt = Some(s);
+            }
+        }
         while let Ok(msg) = ctl.try_recv() {
             match msg {
                 Ctl::Quit => return,
@@ -149,7 +161,9 @@ pub fn run(cfg: Config, shared: Arc<Shared>, apps: Arc<RwLock<AppIndex>>, tts: A
             }
         }
 
-        stt.unload_if_idle(idle);
+        if let Some(s) = stt.as_mut() {
+            s.unload_if_idle(idle);
+        }
         brain.unload_if_idle(idle);
 
         if paused {
@@ -237,7 +251,23 @@ pub fn run(cfg: Config, shared: Arc<Shared>, apps: Arc<RwLock<AppIndex>>, tts: A
                 if let Some(word) = k.feed(&frame) {
                     let t = Instant::now();
                     log::info!("wake word: \"{word}\" — listening now");
-                    woke(&cfg, &shared, &tts, &mut phase, &mut deaf_until);
+                    if loading.is_none() {
+                        if let Some(mut s) = stt.take() {
+                            if s.loaded() {
+                                stt = Some(s);
+                            } else {
+                                loading = std::thread::Builder::new()
+                                    .name("stt-load".into())
+                                    .spawn(move || {
+                                        s.prepare();
+                                        s
+                                    })
+                                    .ok();
+                            }
+                        }
+                    }
+                    woke(&cfg, &shared, &tts, &mut phase);
+                    deaf_frames = WAKE_SETTLE_FRAMES;
                     log::debug!("wake handled in {:?}", t.elapsed());
                     k.reset();
                     spotter_quiet_ms = 0;
@@ -256,7 +286,16 @@ pub fn run(cfg: Config, shared: Arc<Shared>, apps: Arc<RwLock<AppIndex>>, tts: A
                 }
                 continue;
             }
-            let speech = speech && Instant::now() >= deaf_until;
+            // Count the settle window in frames, not in wall-clock time. Frames
+            // arrive in bursts when the thread is busy, and a clock-based window
+            // then declares itself over for frames captured *during* it — muting
+            // seconds of audio instead of the 400 ms it means to.
+            let speech = if deaf_frames > 0 {
+                deaf_frames -= 1;
+                false
+            } else {
+                speech
+            };
 
             let outcome = step(&mut seg, &mut preroll, &frame, speech, &phase, &cfg);
             match outcome {
@@ -264,7 +303,7 @@ pub fn run(cfg: Config, shared: Arc<Shared>, apps: Arc<RwLock<AppIndex>>, tts: A
                 Step::EarlyCheck => {
                     let s = seg.as_mut().unwrap();
                     s.early_checked = true;
-                    let text = transcribe(&mut stt, &s.audio);
+                    let text = transcribe(&mut stt, &mut loading, &s.audio);
                     if wake::detect(&text, &cfg).is_some() {
                         log::info!("wake (early): {text:?}");
                         shared.set_mode(Mode::Listening);
@@ -281,7 +320,7 @@ pub fn run(cfg: Config, shared: Arc<Shared>, apps: Arc<RwLock<AppIndex>>, tts: A
                             if s.rejected || s.early_checked || s.speech_frames < MIN_SPEECH_FRAMES {
                                 continue;
                             }
-                            let text = transcribe(&mut stt, &s.audio);
+                            let text = transcribe(&mut stt, &mut loading, &s.audio);
                             if let Some(hit) = wake::detect(&text, &cfg) {
                                 log::info!("wake: {text:?}");
                                 if has_words(&hit.command) {
@@ -302,7 +341,7 @@ pub fn run(cfg: Config, shared: Arc<Shared>, apps: Arc<RwLock<AppIndex>>, tts: A
                             }
                         }
                         Phase::Command { has_wake } => {
-                            let text = transcribe(&mut stt, &s.audio);
+                            let text = transcribe(&mut stt, &mut loading, &s.audio);
                             let hit = wake::detect(&text, &cfg);
                             // Saying the name again with nothing after it just
                             // re-arms the clock instead of dropping back to sleep.
@@ -348,12 +387,12 @@ pub fn run(cfg: Config, shared: Arc<Shared>, apps: Arc<RwLock<AppIndex>>, tts: A
 
 /// Everything that has to happen the instant the name is heard: the bubble
 /// appears, the chime plays, and the clock starts on the command.
-fn woke(cfg: &Config, shared: &Shared, tts: &Tts, phase: &mut Phase, deaf_until: &mut Instant) {
+fn woke(cfg: &Config, shared: &Shared, tts: &Tts, phase: &mut Phase) {
     let now = Instant::now();
     if cfg.wake_sound {
         crate::chime::play();
     }
-    *deaf_until = now + Duration::from_millis(WAKE_SETTLE_MS);
+
     // Start loading the voice now, so the reply isn't delayed later.
     tts.prepare();
     if cfg.wake_reply && tts.active() {
@@ -438,7 +477,17 @@ fn check_timeout(phase: &mut Phase, shared: &Shared) {
     }
 }
 
-fn transcribe(stt: &mut Stt, audio: &[f32]) -> String {
+/// Transcribe, waiting for a warm-up that is still running and starting one if
+/// the model was never loaded at all.
+fn transcribe(stt: &mut Option<Stt>, loading: &mut Option<std::thread::JoinHandle<Stt>>, audio: &[f32]) -> String {
+    if stt.is_none() {
+        if let Some(handle) = loading.take() {
+            if let Ok(loaded) = handle.join() {
+                *stt = Some(loaded);
+            }
+        }
+    }
+    let Some(stt) = stt.as_mut() else { return String::new() };
     let t = Instant::now();
     match stt.transcribe(audio) {
         Ok(text) => {

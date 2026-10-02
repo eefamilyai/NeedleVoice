@@ -172,6 +172,9 @@ pub struct Config {
     pub command_timeout_secs: f32,
     /// Which speech recogniser to use.
     pub stt_engine: SttEngine,
+    /// Save every clip the recogniser is given, for working out why a word came
+    /// through wrong. They land in `clips/` next to the settings file.
+    pub save_clips: bool,
     /// Whisper model file in the models folder.
     pub whisper_model: String,
     /// CPU threads used for speech recognition and Needle.
@@ -263,6 +266,7 @@ impl Default for Config {
             end_silence_ms: 800,
             command_timeout_secs: 5.0,
             stt_engine: SttEngine::Moonshine,
+            save_clips: false,
             whisper_model: crate::DEFAULT_WHISPER_MODEL.into(),
             threads: recommended_threads(),
             needle_depth: 20,

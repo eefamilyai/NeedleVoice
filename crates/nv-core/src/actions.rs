@@ -80,8 +80,66 @@ pub fn execute_with(action: &Action, cfg: &Config, apps: &AppIndex, speaker: &dy
         Action::Todo { text } => add_item(ItemKind::Todo, text, "", false),
         Action::ShowSchedule { what } => show_schedule(what),
         Action::CancelSchedule { what } => cancel_item(what),
+        Action::ClearSchedule { what } => clear_items(what),
         Action::CompleteTodo { what } => complete_item(what),
     }
+}
+
+/// Which kind of item a spoken word means: "alarms" → Alarm, and "everything"
+/// (or nothing at all) → all of them.
+fn kind_from_words(what: &str) -> Option<ItemKind> {
+    let w = nv_core_text(what);
+    let single = |words: &[&str]| words.iter().any(|k| w.contains(k));
+    if single(&["everything", "all of it", "the lot", "schedule", "everythin"]) {
+        return None;
+    }
+    if single(&["alarm", "timer", "wake"]) {
+        Some(ItemKind::Alarm)
+    } else if single(&["reminder", "remind"]) {
+        Some(ItemKind::Reminder)
+    } else if single(&["todo", "to do", "to-do", "task", "list", "milk"]) {
+        Some(ItemKind::Todo)
+    } else if single(&["event", "calendar", "appointment", "meeting"]) {
+        Some(ItemKind::Event)
+    } else {
+        None
+    }
+}
+
+/// Lowercase and squeeze spaces, for matching spoken words.
+fn nv_core_text(s: &str) -> String {
+    s.to_lowercase().split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Delete every alarm, reminder, to-do or event — all of them when the words
+/// don't name one kind.
+fn clear_items(what: &str) -> Result<String, String> {
+    let mut schedule = Schedule::open();
+    let kind = kind_from_words(what);
+    if schedule.items.is_empty() {
+        return Err("there's nothing on your schedule to delete".to_string());
+    }
+    let gone = schedule.clear(kind);
+    if gone.is_empty() {
+        return Err(match kind {
+            Some(k) => format!("there were no {} to delete", k.label().to_lowercase()),
+            None => "there's nothing on your schedule to delete".to_string(),
+        });
+    }
+    schedule.save().map_err(|e| e.to_string())?;
+    let noun = match kind {
+        Some(k) => k.label().to_lowercase(),
+        None => "items".to_string(),
+    };
+    let names: Vec<String> = gone.iter().take(3).map(|i| i.text.clone()).collect();
+    let mut said = format!("deleted {} {noun}", gone.len());
+    if !names.is_empty() {
+        said.push_str(&format!(" ({})", names.join(", ")));
+        if gone.len() > names.len() {
+            said.push_str(", …");
+        }
+    }
+    Ok(said)
 }
 
 /// Add an alarm, reminder, event or to-do from a spoken time.

@@ -110,7 +110,11 @@ pub const BUILTINS: &[Builtin] = &[
       &[("text", "call mum"), ("when", "?4 pm, or empty")], "remind me to call mum at 4 pm",
       &["remind me to {text} at {when}", "remind me to {text} in {when}", "remind me to {text}",
         "remind me about {text} at {when}", "remind me about {text}", "remind me in {when} to {text}",
-        "remind me at {when} to {text}", "set a reminder to {text} at {when}", "set a reminder for {text} at {when}"]),
+        "remind me at {when} to {text}", "set a reminder to {text} at {when}", "set a reminder for {text} at {when}",
+        // People drop the "me": "reminder to call mum at four".
+        "reminder to {text} at {when}", "reminder to {text}", "reminder for {text} at {when}",
+        "reminder {text} at {when}", "add a reminder to {text} at {when}", "add a reminder for {text} at {when}",
+        "new reminder to {text} at {when}", "make a reminder to {text} at {when}"]),
     b("add_todo", "Schedule", "Add something to the to-do list", &[("text", "buy milk")], "add buy milk to my list",
       &["add {text} to my list", "add {text} to my to do list", "add a todo {text}", "add to do {text}",
         "put {text} on my list", "put {text} on my to do list", "remember to {text}", "add {text} to the list"]),
@@ -119,6 +123,15 @@ pub const BUILTINS: &[Builtin] = &[
       &["add {text} to my calendar at {when}", "put {text} on my calendar at {when}",
         "put {text} in my calendar at {when}", "add {text} to my calendar", "schedule {text} at {when}",
         "add an event {text} at {when}"]),
+    b("clear_schedule", "Schedule", "Delete all alarms, reminders, to-dos or calendar events at once",
+      &[("what", "?alarms, reminders, to dos, events, or everything")], "delete all my alarms",
+      &["delete all {what}", "delete all my {what}", "delete all the {what}", "delete all of my {what}",
+        "delete every {what}", "delete all {what} for me", "clear all {what}", "clear all my {what}",
+        "clear my {what}", "clear the {what}", "remove all {what}", "remove all my {what}",
+        "cancel all {what}", "cancel all my {what}", "delete my {what}", "delete the {what}",
+        "clear my schedule", "delete my schedule", "clear the schedule", "clear everything",
+        "delete everything", "delete all of it", "clear all of it", "cancel everything",
+        "clear my alarms and reminders", "delete all my alarms and reminders"]),
     b("show_schedule", "Schedule", "Read out alarms, reminders, to-dos or today's agenda",
       &[("what", "?alarms, reminders, todos or today")], "what's on my schedule",
       &["what is on my schedule", "whats on my schedule", "what is on my calendar", "whats on my calendar",
@@ -672,6 +685,26 @@ mod tests {
         // Fuzzy never outranks what was actually said.
         let pause = match_any_phrase(&cfg, "stop the music").unwrap();
         assert_eq!(pause.tool, "media_pause");
+    }
+
+    #[test]
+    fn deleting_all_of_something_is_understood() {
+        let cfg = Config::default();
+        for said in [
+            "delete all my alarms",
+            "delete all alarms",
+            "clear my reminders",
+            "cancel all my reminders",
+            "remove all my to dos",
+            "delete everything",
+            "clear my schedule",
+        ] {
+            let hit = match_any_phrase(&cfg, said).unwrap_or_else(|| panic!("no match for {said:?}"));
+            assert_eq!(hit.tool, "clear_schedule", "{said:?} went to {}", hit.tool);
+        }
+        // ...and it says what it is clearing.
+        let hit = match_any_phrase(&cfg, "delete all my alarms").unwrap();
+        assert_eq!(hit.captures, vec![("what".to_string(), "alarms".to_string())]);
     }
 
     #[test]
