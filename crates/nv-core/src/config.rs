@@ -60,6 +60,45 @@ pub struct Alias {
     pub target: String,
 }
 
+/// How the settings app is coloured.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Appearance {
+    /// Follow the Windows "app mode" setting.
+    System,
+    Dark,
+    Light,
+}
+
+impl Appearance {
+    pub const ALL: [Appearance; 3] = [Appearance::System, Appearance::Dark, Appearance::Light];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Appearance::System => "System",
+            Appearance::Dark => "Dark",
+            Appearance::Light => "Light",
+        }
+    }
+
+    pub fn is_dark(self) -> bool {
+        match self {
+            Appearance::Dark => true,
+            Appearance::Light => false,
+            // Unreadable means dark, which is what this app has always been.
+            Appearance::System => !windows_prefers_light_apps().unwrap_or(false),
+        }
+    }
+}
+
+/// Windows' "Choose your default app mode": true when apps should be light.
+fn windows_prefers_light_apps() -> Option<bool> {
+    use windows::Win32::System::Registry::HKEY_CURRENT_USER;
+    let key = r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize";
+    crate::win::reg_get_dword(HKEY_CURRENT_USER, key, "AppsUseLightTheme").map(|v| v != 0)
+}
+
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
@@ -138,6 +177,8 @@ pub struct Config {
     pub show_overlay: bool,
     /// Neon accent colour, `#RRGGBB`.
     pub accent_color: String,
+    /// Which look the settings app uses.
+    pub appearance: Appearance,
     /// Diameter of the bubble, in pixels (before DPI scaling).
     pub overlay_size: u32,
     /// Gap between the bubble and the bottom of the screen / taskbar.
@@ -203,6 +244,7 @@ impl Default for Config {
             voice_volume: 90,
             show_overlay: true,
             accent_color: "#B6FF2E".into(),
+            appearance: Appearance::System,
             overlay_size: 72,
             overlay_margin: 36,
             aliases: vec![

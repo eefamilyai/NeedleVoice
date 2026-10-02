@@ -31,7 +31,7 @@ use windows::Win32::System::Diagnostics::ToolHelp::{
 use windows::Win32::System::Registry::{
     RegCloseKey, RegCreateKeyExW, RegDeleteKeyW, RegDeleteValueW, RegGetValueW, RegOpenKeyExW,
     RegSetValueExW, HKEY, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, KEY_SET_VALUE, KEY_WRITE,
-    REG_DWORD, REG_OPTION_NON_VOLATILE, REG_SZ, RRF_RT_REG_SZ,
+    REG_DWORD, REG_OPTION_NON_VOLATILE, REG_SZ, RRF_RT_REG_DWORD, RRF_RT_REG_SZ,
 };
 use windows::Win32::System::Threading::{
     CreateMutexW, OpenProcess, TerminateProcess, PROCESS_TERMINATE,
@@ -88,6 +88,24 @@ pub fn launch_app_id(app_id: &str) -> Result<(), String> {
 
 const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
 const UNINSTALL_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Uninstall\NeedleVoice";
+
+/// Read a REG_DWORD value, e.g. whether Windows prefers light apps.
+pub fn reg_get_dword(root: HKEY, key: &str, value: &str) -> Option<u32> {
+    let mut data: u32 = 0;
+    let mut size = std::mem::size_of::<u32>() as u32;
+    let r = unsafe {
+        RegGetValueW(
+            root,
+            &HSTRING::from(key),
+            PCWSTR(HSTRING::from(value).as_ptr()),
+            RRF_RT_REG_DWORD,
+            None,
+            Some((&mut data as *mut u32).cast()),
+            Some(&mut size),
+        )
+    };
+    r.is_ok().then_some(data)
+}
 
 pub fn reg_get_string(root: HKEY, key: &str, value: Option<&str>) -> Option<String> {
     let mut buf = vec![0u16; 1024];
@@ -766,6 +784,12 @@ pub fn run_capture_command(
         )),
         None => Err(format!("it took longer than {} seconds", timeout.as_secs())),
     }
+}
+
+/// Stop a running process by image name. The agent has no IPC, so this is how
+/// the settings app's Stop button and the tray's Exit both end it.
+pub fn stop_process(image: &str) -> bool {
+    run_capture("taskkill", &["/IM", image, "/F"], std::time::Duration::from_secs(10)).is_ok()
 }
 
 /// Where Python is, if it's installed.

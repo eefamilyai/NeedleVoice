@@ -3,6 +3,8 @@
 
 mod jobs;
 mod miccheck;
+mod shell;
+mod ui;
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -12,7 +14,7 @@ use eframe::egui::{self, Color32, RichText, Stroke};
 use jobs::Job;
 use nv_core::apps::AppIndex;
 use nv_core::brain::Brain;
-use nv_core::config::{parse_hex, Alias, Browser, ACCENT_PRESETS};
+use nv_core::config::{parse_hex, Alias, Appearance, Browser, ACCENT_PRESETS};
 use nv_core::schedule::{describe_when, Item, ItemKind, Repeat, Schedule, Stamp};
 use nv_core::tools::{self, CustomKind, CustomTool, Step, StepKind};
 use nv_core::personality::{self, Moment, Persona};
@@ -32,17 +34,6 @@ enum Tab {
     Test,
 }
 
-const TABS: [(Tab, &str); 9] = [
-    (Tab::General, "✨  General"),
-    (Tab::Voice, "🗣  Voice & personality"),
-    (Tab::Listening, "🎙  Listening"),
-    (Tab::Schedule, "⏰  Alarms & reminders"),
-    (Tab::Brain, "🧠  Brain"),
-    (Tab::Browser, "🌐  Browser"),
-    (Tab::Apps, "📦  Apps"),
-    (Tab::Functions, "⚙  Functions"),
-    (Tab::Test, "🧪  Test a command"),
-];
 
 /// The half-filled "add to the schedule" form.
 struct NewItem {
@@ -135,8 +126,9 @@ impl App {
             Ok(c) => (c, None),
             Err(e) => (Config::default(), Some(e)),
         };
-        apply_theme(&cc.egui_ctx, cfg.accent_rgb());
-        install_fonts(&cc.egui_ctx);
+        let theme = ui::Theme::new(cfg.appearance.is_dark(), accent32(cfg.accent_rgb()));
+        ui::style(&cc.egui_ctx, &theme);
+        ui::install_fonts(&cc.egui_ctx);
         let tab = match args.iter().skip_while(|a| *a != "--tab").nth(1).map(String::as_str) {
             Some("voice") => Tab::Voice,
             Some("listening") => Tab::Listening,
@@ -213,6 +205,16 @@ impl App {
         }
     }
 
+    /// Stop the assistant: the same thing the tray's Exit does.
+    fn stop_agent(&mut self) {
+        if win::stop_process(nv_core::AGENT_EXE) {
+            self.toast("Assistant stopped", true);
+            self.agent_running = false;
+        } else {
+            self.toast("The assistant wasn't running", false);
+        }
+    }
+
     fn job_running(&self, key: &str) -> Option<&Job> {
         self.jobs.iter().find(|(k, j)| k == key && !j.done()).map(|(_, j)| j)
     }
@@ -280,237 +282,7 @@ impl App {
             self.toast("Playing preview… (neural voices take a second to load)", true);
         }
     }
-}
 
-fn accent32((r, g, b): (f32, f32, f32)) -> Color32 {
-    Color32::from_rgb((r * 255.0) as u8, (g * 255.0) as u8, (b * 255.0) as u8)
-}
-
-fn apply_theme(ctx: &egui::Context, accent: (f32, f32, f32)) {
-    let a = accent32(accent);
-    let mut v = egui::Visuals::dark();
-    v.panel_fill = Color32::from_rgb(13, 15, 20);
-    v.window_fill = Color32::from_rgb(18, 21, 28);
-    v.extreme_bg_color = Color32::from_rgb(8, 9, 13);
-    v.faint_bg_color = Color32::from_rgb(22, 25, 33);
-    v.selection.bg_fill = a.linear_multiply(0.35);
-    v.selection.stroke = Stroke::new(1.0, a);
-    v.hyperlink_color = a;
-    v.widgets.hovered.bg_stroke = Stroke::new(1.0, a.linear_multiply(0.7));
-    v.widgets.active.bg_stroke = Stroke::new(1.5, a);
-    v.widgets.inactive.corner_radius = 6.0.into();
-    v.widgets.hovered.corner_radius = 6.0.into();
-    v.widgets.active.corner_radius = 6.0.into();
-    ctx.set_visuals(v);
-    ctx.all_styles_mut(|s| {
-        s.spacing.item_spacing = egui::vec2(10.0, 9.0);
-        s.spacing.button_padding = egui::vec2(12.0, 5.0);
-    });
-}
-
-/// `media_pause` → "Media pause": the technical name stays in the tooltip.
-fn pretty_name(s: &str) -> String {
-    let spaced = s.replace('_', " ");
-    let mut chars = spaced.chars();
-    match chars.next() {
-        Some(first) => first.to_uppercase().chain(chars).collect(),
-        None => spaced,
-    }
-}
-
-fn heading(ui: &mut egui::Ui, text: &str, accent: Color32) {
-    ui.add_space(4.0);
-    ui.label(RichText::new(text).size(20.0).strong().color(accent));
-    ui.add_space(2.0);
-}
-
-fn hint(ui: &mut egui::Ui, text: &str) {
-    ui.label(RichText::new(text).small().color(Color32::from_gray(140)));
-}
-
-fn section(ui: &mut egui::Ui, title: &str, body: impl FnOnce(&mut egui::Ui)) {
-    egui::Frame::group(ui.style())
-        .fill(Color32::from_rgb(18, 21, 28))
-        .stroke(Stroke::new(1.0, Color32::from_rgb(34, 38, 48)))
-        .corner_radius(10.0)
-        .inner_margin(14.0)
-        .show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            ui.label(RichText::new(title).strong().size(15.0));
-            ui.add_space(4.0);
-            body(ui);
-        });
-    ui.add_space(8.0);
-}
-
-impl eframe::App for App {
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        let ctx = ui.ctx().clone();
-        if self.last_poll.elapsed() > Duration::from_secs(2) {
-            self.agent_running = win::is_running(nv_core::AGENT_EXE);
-            self.last_poll = Instant::now();
-        }
-        self.poll_jobs();
-        // Mic meters run only while the Listening tab is open.
-        if self.tab == Tab::Listening {
-            if self.mic_check.is_none() {
-                self.mic_check = Some(miccheck::MicCheck::open());
-            }
-            ctx.request_repaint_after(miccheck::repaint());
-        } else if self.mic_check.as_ref().is_some_and(|m| m.phase == miccheck::Phase::Idle) {
-            self.mic_check = None;
-        }
-        if !self.jobs.is_empty() || self.test_job.is_some() {
-            ctx.request_repaint_after(Duration::from_millis(100));
-        } else {
-            ctx.request_repaint_after(Duration::from_secs(2));
-        }
-        let accent = accent32(self.cfg.accent_rgb());
-
-        // ── sidebar ──
-        egui::Panel::left("tabs").exact_size(220.0).resizable(false).show(ui, |ui| {
-            ui.add_space(12.0);
-            ui.horizontal(|ui| {
-                let (rect, _) = ui.allocate_exact_size(egui::vec2(26.0, 26.0), egui::Sense::hover());
-                orb(ui, rect, accent);
-                ui.label(RichText::new("NeedleVoice").size(19.0).strong());
-            });
-            hint(ui, &format!("Say \"{}\"", self.cfg.wake_phrase()));
-            ui.add_space(14.0);
-            for (tab, label) in TABS {
-                let sel = self.tab == tab;
-                let text = RichText::new(label).size(14.5).color(if sel { accent } else { Color32::from_gray(200) });
-                if ui.add_sized([200.0, 32.0], egui::Button::selectable(sel, text)).clicked() {
-                    self.tab = tab;
-                }
-            }
-            ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
-                ui.add_space(10.0);
-                ui.horizontal(|ui| {
-                    if self.agent_running {
-                        if ui.button("Stop").clicked() {
-                            win::kill_by_exe(nv_core::AGENT_EXE);
-                            self.agent_running = false;
-                        }
-                        if ui.button("Restart").clicked() {
-                            win::kill_by_exe(nv_core::AGENT_EXE);
-                            std::thread::sleep(Duration::from_millis(300));
-                            self.start_agent();
-                        }
-                    } else if ui.button("▶ Start assistant").clicked() {
-                        self.start_agent();
-                        self.agent_running = true;
-                    }
-                });
-                let (dot, txt) = if self.agent_running {
-                    (accent, if self.cfg.paused { "Running (paused)" } else { "Running & listening" })
-                } else {
-                    (Color32::from_rgb(255, 80, 90), "Not running")
-                };
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new("●").color(dot));
-                    ui.label(txt);
-                });
-                ui.add_space(6.0);
-                ui.label(
-                    RichText::new("Brain: Needle 3 by Cactus Compute (Apache-2.0)").small().color(Color32::from_gray(120)),
-                );
-                ui.label(
-                    RichText::new("Speech: whisper.cpp · sherpa-onnx · Piper · Kokoro").small().color(Color32::from_gray(120)),
-                );
-                if ui
-                    .add(egui::Button::new(RichText::new("Credits").small()).frame(false))
-                    .on_hover_text("Full list, licences and the citation in CREDITS.md")
-                    .clicked()
-                {
-                    let _ = win::shell_open("https://huggingface.co/Cactus-Compute/needle3", None);
-                }
-            });
-        });
-
-        // ── bottom bar ──
-        egui::Panel::bottom("bar").exact_size(52.0).show(ui, |ui| {
-            ui.horizontal_centered(|ui| {
-                let dirty = self.cfg != self.saved;
-                let save = egui::Button::new(RichText::new("💾  Save & apply").strong().color(Color32::BLACK))
-                    .fill(if dirty { accent } else { accent.linear_multiply(0.4) });
-                if ui.add_enabled(dirty, save).clicked() {
-                    self.save();
-                    apply_theme(&ctx, self.cfg.accent_rgb());
-                }
-                if dirty && ui.button("Undo changes").clicked() {
-                    self.cfg = self.saved.clone();
-                }
-                if let Some(e) = &self.load_error {
-                    ui.label(
-                        RichText::new(format!("⚠ {e} — showing defaults. Saving will overwrite it."))
-                            .color(Color32::from_rgb(255, 95, 105)),
-                    );
-                }
-                if let Some((msg, at, ok)) = &self.status {
-                    if at.elapsed() < Duration::from_secs(8) {
-                        let c = if *ok { accent } else { Color32::from_rgb(255, 95, 105) };
-                        ui.label(RichText::new(msg).color(c));
-                    }
-                }
-                for (_, job) in &self.jobs {
-                    let st = job.0.lock().unwrap();
-                    ui.separator();
-                    ui.label(&st.label);
-                    if st.progress >= 0.0 {
-                        ui.add(egui::ProgressBar::new(st.progress).desired_width(140.0).show_percentage());
-                    } else {
-                        ui.spinner();
-                    }
-                }
-            });
-        });
-
-        egui::CentralPanel::default().show(ui, |ui| {
-            egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-                ui.add_space(6.0);
-                match self.tab {
-                    Tab::General => self.tab_general(ui, accent),
-                    Tab::Voice => self.tab_voice(ui, &ctx, accent),
-                    Tab::Listening => self.tab_listening(ui, &ctx, accent),
-                    Tab::Schedule => self.tab_schedule(ui, accent),
-                    Tab::Brain => self.tab_brain(ui, accent),
-                    Tab::Browser => self.tab_browser(ui, accent),
-                    Tab::Apps => self.tab_apps(ui, &ctx, accent),
-                    Tab::Functions => self.tab_functions(ui, &ctx, accent),
-                    Tab::Test => self.tab_test(ui, &ctx, accent),
-                }
-            });
-        });
-    }
-}
-
-/// The "say any of these" box.
-///
-/// `draft` is what the user is typing and is never written from `stored`; the
-/// stored list is only ever derived from it. The other way round — rebuilding
-/// the text from the parsed list every frame — is what made Enter look broken:
-/// the newline was normalised away before the next frame could draw it.
-fn phrases_field(ui: &mut egui::Ui, draft: &mut String, stored: &mut Vec<String>) -> egui::Response {
-    let response = ui.add(egui::TextEdit::multiline(draft).desired_rows(3).desired_width(400.0));
-    if response.changed() {
-        *stored = draft.lines().map(|l| l.trim().to_lowercase()).filter(|l| !l.is_empty()).collect();
-    }
-    response
-}
-
-/// A tiny neon orb for the header and colour swatches.
-fn orb(ui: &egui::Ui, rect: egui::Rect, c: Color32) {
-    let p = ui.painter();
-    let center = rect.center();
-    let r = rect.width().min(rect.height()) / 2.0;
-    p.circle_filled(center, r, c.linear_multiply(0.18));
-    p.circle_filled(center, r * 0.78, Color32::from_rgb(10, 11, 16));
-    p.circle_filled(center + egui::vec2(-r * 0.2, -r * 0.15), r * 0.42, c.linear_multiply(0.75));
-    p.circle_stroke(center, r * 0.78, Stroke::new(1.6, c));
-}
-
-impl App {
     /// The editing buffer for a field: what has been typed so far, or the
     /// stored value the first time round.
     fn buffer(&self, key: &str, stored: &str) -> String {
@@ -528,105 +300,143 @@ impl App {
     }
 
     fn tab_general(&mut self, ui: &mut egui::Ui, accent: Color32) {
-        heading(ui, "General", accent);
-        section(ui, "Wake word", |ui| {
-            ui.horizontal(|ui| {
-                ui.label("Assistant name");
-                ui.add(egui::TextEdit::singleline(&mut self.cfg.agent_name).desired_width(160.0));
+        let _ = accent;
+        ui::card_rows(ui, "Wake word", "How it knows you are talking to it", |ui| {
+            ui::row(ui, "Assistant name", "Two syllables or more is harder to trigger by accident", |ui| {
+                ui::text_field(ui, &mut self.cfg.agent_name, "Nova", 220.0);
             });
-            hint(ui, "Pick something distinctive with 2+ syllables (e.g. Nova, Jarvis, Echo) — it's harder to trigger by accident.");
             let mut prefixes = self.buffer("wake:prefixes", &self.cfg.wake_prefixes.join(", "));
-            ui.horizontal(|ui| {
-                ui.label("Words before the name");
-                if ui.add(egui::TextEdit::singleline(&mut prefixes).desired_width(220.0)).changed() {
+            ui::row(ui, "Words before the name", "Comma separated", |ui| {
+                if ui::text_field(ui, &mut prefixes, "hey, ok", 220.0).changed() {
                     self.cfg.wake_prefixes =
                         prefixes.split(',').map(|s| s.trim().to_lowercase()).filter(|s| !s.is_empty()).collect();
                 }
             });
             self.keep("wake:prefixes", prefixes);
-            ui.checkbox(&mut self.cfg.allow_name_only, "Also wake on just the name (no \"hey\")");
-            ui.horizontal(|ui| {
-                ui.label("Also answer to");
-                let mut extra = self.buffer("wake:extra", &self.cfg.wake_extra_names.join(", "));
-                if ui
-                    .add(egui::TextEdit::singleline(&mut extra).hint_text("no va, hey novah").desired_width(250.0))
-                    .changed()
-                {
+            ui::row(ui, "Answer to the bare name", "Wake on the name alone, without a word in front", |ui| {
+                ui::switch(ui, &mut self.cfg.allow_name_only, "");
+            });
+            let mut extra = self.buffer("wake:extra", &self.cfg.wake_extra_names.join(", "));
+            ui::row(ui, "Also answers to", "Spellings it keeps mis-hearing, comma separated", |ui| {
+                if ui::text_field(ui, &mut extra, "no va, hey novah", 220.0).changed() {
                     self.cfg.wake_extra_names =
                         extra.split(',').map(|s| s.trim().to_lowercase()).filter(|s| !s.is_empty()).collect();
                 }
-                self.keep("wake:extra", extra);
             });
-            hint(ui, "Comma-separated extra spellings. If it keeps mis-hearing your accent, add what it hears here — no retraining needed.");
-            ui.add(egui::Slider::new(&mut self.cfg.wake_sensitivity, 0.0..=1.0).text("Sensitivity"));
-            hint(ui, "Higher = wakes more easily, but also more false alarms.");
-            ui.checkbox(&mut self.cfg.wake_sound, "Play a chime the moment it hears you");
-            ui.checkbox(&mut self.cfg.wake_reply, "Say a quick \"Yes?\" when it wakes");
-            hint(ui, "The bubble and the chime appear the instant the name is recognised. A spoken reply is even clearer, but it talks over the first word of your command.");
+            self.keep("wake:extra", extra);
+            ui::row(ui, "Sensitivity", "Higher wakes more easily, and more often by mistake", |ui| {
+                ui.add(egui::Slider::new(&mut self.cfg.wake_sensitivity, 0.0..=1.0).show_value(true));
+            });
+            ui::row(ui, "Chime on wake", "The instant the name is recognised", |ui| {
+                ui::switch(ui, &mut self.cfg.wake_sound, "");
+            });
+            ui::row(ui, "Say \"Yes?\" on wake", "Clearer, but it talks over your first word", |ui| {
+                ui::switch(ui, &mut self.cfg.wake_reply, "");
+            });
+            ui.add_space(2.0);
             self.wake_advanced(ui);
         });
-        section(ui, "Bubble", |ui| {
-            ui.checkbox(&mut self.cfg.show_overlay, "Show the listening bubble at the bottom of the screen");
-            ui.label("Neon colour");
-            ui.horizontal_wrapped(|ui| {
-                for (name, hex) in ACCENT_PRESETS {
-                    let (r, g, b) = parse_hex(hex).unwrap();
-                    let c = accent32((r, g, b));
-                    let (rect, resp) = ui.allocate_exact_size(egui::vec2(46.0, 46.0), egui::Sense::click());
-                    orb(ui, rect.shrink(4.0), c);
-                    if self.cfg.accent_color.eq_ignore_ascii_case(hex) {
-                        ui.painter().circle_stroke(rect.center(), 22.0, Stroke::new(2.0, Color32::WHITE));
+
+        ui::card(ui, "Bubble", "The floating circle at the bottom of the screen", |ui| {
+            ui::switch(ui, &mut self.cfg.show_overlay, "Show the bubble while listening");
+            ui.add_space(10.0);
+            ui::field(ui, "Accent colour", "Used across the bubble, this window and the tray icon", |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    for (name, hex) in ACCENT_PRESETS {
+                        let (r, g, b) = parse_hex(hex).unwrap();
+                        let c = accent32((r, g, b));
+                        let selected = self.cfg.accent_color.eq_ignore_ascii_case(hex);
+                        if ui::swatch(ui, c, selected).on_hover_text(*name).clicked() {
+                            self.cfg.accent_color = hex.to_string();
+                        }
                     }
-                    if resp.on_hover_text(*name).clicked() {
-                        self.cfg.accent_color = hex.to_string();
+                    let (r, g, b) = self.cfg.accent_rgb();
+                    let mut rgb = [(r * 255.0) as u8, (g * 255.0) as u8, (b * 255.0) as u8];
+                    if ui.color_edit_button_srgb(&mut rgb).on_hover_text("Custom colour").changed() {
+                        self.cfg.accent_color = format!("#{:02X}{:02X}{:02X}", rgb[0], rgb[1], rgb[2]);
                     }
-                }
-                let (r, g, b) = self.cfg.accent_rgb();
-                let mut rgb = [(r * 255.0) as u8, (g * 255.0) as u8, (b * 255.0) as u8];
-                if ui.color_edit_button_srgb(&mut rgb).on_hover_text("Custom colour").changed() {
-                    self.cfg.accent_color = format!("#{:02X}{:02X}{:02X}", rgb[0], rgb[1], rgb[2]);
+                });
+            });
+            ui::field(ui, "Appearance", "Dark, light, or whatever Windows is set to", |ui| {
+                let mut appearance = self.cfg.appearance;
+                if ui::segmented(ui, &mut appearance, &Appearance::ALL.map(|a| (a, a.label()))) {
+                    self.cfg.appearance = appearance;
                 }
             });
-            ui.add(egui::Slider::new(&mut self.cfg.overlay_size, 40..=160).text("Size (px)"));
-            ui.add(egui::Slider::new(&mut self.cfg.overlay_margin, 0..=300).text("Distance from bottom (px)"));
+            ui::field(ui, "Bubble size", "", |ui| {
+                ui.add(egui::Slider::new(&mut self.cfg.overlay_size, 40..=160).suffix(" px"));
+            });
+            ui::field(ui, "Distance from the bottom", "", |ui| {
+                ui.add(egui::Slider::new(&mut self.cfg.overlay_margin, 0..=300).suffix(" px"));
+            });
         });
-        section(ui, "System", |ui| {
-            ui.checkbox(&mut self.cfg.start_with_windows, "Start automatically when I sign in to Windows");
-            ui.checkbox(&mut self.cfg.paused, "Paused (microphone off)");
-            ui.horizontal(|ui| {
-                if ui.button("Open log file").clicked() {
-                    let _ = win::shell_open(&nv_core::paths::log_file().display().to_string(), None);
-                }
-                if ui.button("Open settings folder").clicked() {
+
+        ui::card_rows(ui, "Windows", "How it fits in with the rest of the system", |ui| {
+            ui::row(ui, "Start with Windows", "Launch the assistant when you sign in", |ui| {
+                ui::switch(ui, &mut self.cfg.start_with_windows, "");
+            });
+            ui::row(ui, "Paused", "Keep the microphone closed until you unpause", |ui| {
+                ui::switch(ui, &mut self.cfg.paused, "");
+            });
+            ui::row(ui, "Files", "Settings, the log, and the schedule", |ui| {
+                if ui::ghost(ui, "Open settings folder").clicked() {
                     let _ = win::shell_open(&nv_core::paths::data_dir().display().to_string(), None);
+                }
+                if ui::ghost(ui, "Open the log").clicked() {
+                    let _ = win::shell_open(&nv_core::paths::log_file().display().to_string(), None);
                 }
             });
         });
     }
 
     fn tab_voice(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, accent: Color32) {
-        heading(ui, "Voice & personality", accent);
-        section(ui, "Personality", |ui| {
-            for p in Persona::ALL {
-                ui.radio_value(&mut self.cfg.personality, p, p.label());
-            }
-            let a = nv_core::brain::Action::WebSearch("the Haber process".into());
-            let sample = personality::example(self.cfg.personality, &Moment::Done(&a));
-            ui.label(RichText::new(format!("e.g. \"{sample}\"")).italics().color(Color32::from_gray(170)));
+        let _ = accent;
+        let t = ui::theme(ui);
+        ui::card(ui, "Personality", "How it talks back to you", |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing = egui::vec2(6.0, 6.0);
+                for persona in Persona::ALL {
+                    let selected = self.cfg.personality == persona;
+                    let text = RichText::new(persona.label()).size(12.5).color(if selected { t.on_accent } else { t.muted });
+                    let button = egui::Button::new(text)
+                        .fill(if selected { t.accent } else { t.inset })
+                        .stroke(t.hairline())
+                        .corner_radius(egui::CornerRadius::same(8))
+                        .min_size(egui::vec2(0.0, 28.0));
+                    if ui.add(button).clicked() {
+                        self.cfg.personality = persona;
+                    }
+                }
+            });
+            ui.add_space(10.0);
+            let action = nv_core::brain::Action::WebSearch("the Haber process".into());
+            let sample = personality::example(self.cfg.personality, &Moment::Done(&action));
+            ui.label(RichText::new(format!("\u{201C}{sample}\u{201D}")).size(13.0).italics().color(t.muted));
         });
 
         let mut preview = false;
-        section(ui, "Voice", |ui| {
-            ui.checkbox(&mut self.cfg.voice_enabled, "Talk back out loud");
+        ui::card_rows(ui, "Voice", "What it sounds like out loud", |ui| {
+            ui::row(ui, "Talk back out loud", "", |ui| {
+                ui::switch(ui, &mut self.cfg.voice_enabled, "");
+            });
             ui.add_enabled_ui(self.cfg.voice_enabled, |ui| {
-                for e in Engine::ALL {
-                    ui.radio_value(&mut self.cfg.voice_engine, e, e.label());
-                }
-                ui.add(egui::Slider::new(&mut self.cfg.voice_speed, 0.6..=1.6).text("Speed"));
-                ui.add(egui::Slider::new(&mut self.cfg.voice_volume, 0..=100).text("Volume"));
-                if ui.button("▶  Preview voice").clicked() {
-                    preview = true;
-                }
+                ui::row(ui, "Engine", "", |ui| {
+                    let mut engine = self.cfg.voice_engine;
+                    if ui::segmented(ui, &mut engine, &Engine::ALL.map(|e| (e, e.label_short()))) {
+                        self.cfg.voice_engine = engine;
+                    }
+                });
+                ui::row(ui, "Speed", "", |ui| {
+                    ui.add(egui::Slider::new(&mut self.cfg.voice_speed, 0.6..=1.6));
+                });
+                ui::row(ui, "Volume", "", |ui| {
+                    ui.add(egui::Slider::new(&mut self.cfg.voice_volume, 0..=100));
+                });
+                ui::row(ui, "Hear it", "Speaks a sample line in the voice you picked", |ui| {
+                    if ui::ghost(ui, "Preview voice").clicked() {
+                        preview = true;
+                    }
+                });
             });
         });
         if preview {
@@ -634,23 +444,34 @@ impl App {
         }
 
         if !self.cfg.voice_enabled {
+            ui::hint(ui, "With this off, it answers on screen and in the log only.");
             return;
         }
         match self.cfg.voice_engine {
             Engine::Piper => self.piper_list(ui, ctx, accent),
             Engine::Kokoro => self.kokoro_panel(ui, ctx, accent),
             Engine::System => {
-                section(ui, "Windows voice", |ui| {
-                    egui::ComboBox::from_id_salt("sysvoice")
-                        .width(360.0)
-                        .selected_text(if self.cfg.system_voice.is_empty() { "System default" } else { &self.cfg.system_voice })
-                        .show_ui(ui, |ui| {
-                            ui.selectable_value(&mut self.cfg.system_voice, String::new(), "System default");
-                            for v in &self.system_voices {
-                                ui.selectable_value(&mut self.cfg.system_voice, v.clone(), v);
-                            }
-                        });
-                    hint(ui, "These are the classic Windows voices. For a human-sounding voice choose Natural or Ultra-realistic above.");
+                ui::card_rows(ui, "Windows voice", "The classic built-in voices", |ui| {
+                    ui::row(ui, "Voice", "", |ui| {
+                        egui::ComboBox::from_id_salt("sysvoice")
+                            .width(280.0)
+                            .selected_text(if self.cfg.system_voice.is_empty() {
+                                "System default".to_string()
+                            } else {
+                                self.cfg.system_voice.clone()
+                            })
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(&mut self.cfg.system_voice, String::new(), "System default");
+                                for v in &self.system_voices {
+                                    ui.selectable_value(&mut self.cfg.system_voice, v.clone(), v);
+                                }
+                            });
+                    });
+                    ui.horizontal(|ui| {
+                        ui.add_space(14.0);
+                        ui::hint(ui, "Robotic but instant. Natural and Ultra-realistic sound human.");
+                    });
+                    ui.add_space(6.0);
                 });
             }
         }
@@ -748,43 +569,74 @@ impl App {
     }
 
     fn tab_listening(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, accent: Color32) {
-        heading(ui, "Listening", accent);
         self.wake_model_ui(ui, ctx, accent);
         self.mic_check_ui(ui, ctx, accent);
-        section(ui, "Microphone", |ui| {
-            egui::ComboBox::from_id_salt("mic")
-                .width(360.0)
-                .selected_text(if self.cfg.microphone.is_empty() { "Windows default microphone" } else { &self.cfg.microphone })
-                .show_ui(ui, |ui| {
-                    ui.selectable_value(&mut self.cfg.microphone, String::new(), "Windows default microphone");
-                    for m in &self.mics {
-                        ui.selectable_value(&mut self.cfg.microphone, m.clone(), m);
+
+        ui::card_rows(ui, "Microphone", "Which device it listens to, and how it hears you", |ui| {
+            ui::row(ui, "Device", "", |ui| {
+                egui::ComboBox::from_id_salt("mic")
+                    .width(300.0)
+                    .selected_text(if self.cfg.microphone.is_empty() {
+                        "Windows default microphone".to_string()
+                    } else {
+                        self.cfg.microphone.clone()
+                    })
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut self.cfg.microphone, String::new(), "Windows default microphone");
+                        for m in &self.mics {
+                            ui.selectable_value(&mut self.cfg.microphone, m.clone(), m);
+                        }
+                    });
+            });
+            ui::row(ui, "Noise filtering", "Higher ignores more background noise, but can miss quiet speech", |ui| {
+                ui.add(egui::Slider::new(&mut self.cfg.vad_aggressiveness, 0..=3));
+            });
+            ui::row(ui, "Mic boost", "Applied before anything else hears it", |ui| {
+                ui.add(egui::Slider::new(&mut self.cfg.mic_gain_db, 0.0..=40.0).suffix(" dB"));
+            });
+            ui::row(ui, "Minimum loudness", "Quieter than this is treated as silence", |ui| {
+                ui.add(egui::Slider::new(&mut self.cfg.min_speech_db, -75.0..=-20.0).suffix(" dB"));
+            });
+            ui::row(ui, "Pause that ends a command", "Silence this long finishes the sentence", |ui| {
+                ui.add(egui::Slider::new(&mut self.cfg.end_silence_ms, 300..=2500).suffix(" ms"));
+            });
+            ui::row(ui, "Wait after waking", "How long it stays ready for a command", |ui| {
+                ui.add(egui::Slider::new(&mut self.cfg.command_timeout_secs, 2.0..=15.0).suffix(" s"));
+            });
+            ui::row(ui, "Set these for me", "The microphone check measures your voice and room", |ui| {
+                if ui::ghost(ui, "Run the check").clicked() {
+                    self.mic_check = Some(miccheck::MicCheck::open());
+                    if let Some(mc) = self.mic_check.as_mut() {
+                        mc.start();
                     }
-                });
-            ui.add(egui::Slider::new(&mut self.cfg.vad_aggressiveness, 0..=3).text("Noise filtering"));
-            hint(ui, "Higher ignores more background noise (TV, fans) but may miss quiet speech.");
-            ui.add(egui::Slider::new(&mut self.cfg.mic_gain_db, 0.0..=40.0).text("Mic boost (dB)"));
-            ui.add(egui::Slider::new(&mut self.cfg.min_speech_db, -75.0..=-20.0).text("Minimum loudness (dB)"));
-            hint(ui, "Tip: the Microphone check above sets these for you.");
-            ui.add(egui::Slider::new(&mut self.cfg.end_silence_ms, 300..=2500).text("Pause that ends a command (ms)"));
-            ui.add(egui::Slider::new(&mut self.cfg.command_timeout_secs, 2.0..=15.0).text("Wait for a command after waking (s)"));
+                }
+            });
         });
+
         let models = nv_core::paths::models_dir();
         let mut download: Option<(&'static str, u32)> = None;
-        section(ui, "Speech recognition (Whisper)", |ui| {
+        ui::card_rows(ui, "Speech recognition", "Whisper turns the command into text", |ui| {
             for (file, label, mb) in WHISPER_MODELS {
                 let have = models.join(file).exists();
-                ui.horizontal(|ui| {
-                    ui.add_enabled_ui(have, |ui| {
-                        ui.radio_value(&mut self.cfg.whisper_model, file.to_string(), label);
-                    });
-                    if !have {
-                        if let Some(job) = self.job_running(file) {
-                            let p = job.0.lock().unwrap().progress;
-                            ui.add(egui::ProgressBar::new(p.max(0.0)).desired_width(110.0).show_percentage());
-                        } else if ui.small_button(format!("⬇ Get ({mb} MB)")).clicked() {
-                            download = Some((file, mb));
+                ui::row(ui, label, if have { "" } else { "not downloaded yet" }, |ui| {
+                    if have {
+                        let selected = self.cfg.whisper_model == *file;
+                        let text = RichText::new(if selected { "In use" } else { "Use this" })
+                            .size(12.5)
+                            .color(if selected { ui::theme(ui).on_accent } else { ui::theme(ui).muted });
+                        let button = egui::Button::new(text)
+                            .fill(if selected { ui::theme(ui).accent } else { ui::theme(ui).inset })
+                            .stroke(ui::theme(ui).hairline())
+                            .corner_radius(egui::CornerRadius::same(8))
+                            .min_size(egui::vec2(0.0, 26.0));
+                        if ui.add_enabled(!selected, button).clicked() {
+                            self.cfg.whisper_model = file.to_string();
                         }
+                    } else if let Some(job) = self.job_running(file) {
+                        let progress = job.0.lock().map(|s| s.progress).unwrap_or(-1.0);
+                        ui.add(egui::ProgressBar::new(progress.max(0.0)).desired_width(140.0).fill(ui::theme(ui).accent));
+                    } else if ui::ghost(ui, &format!("Download ({mb} MB)")).clicked() {
+                        download = Some((file, mb));
                     }
                 });
             }
@@ -799,19 +651,35 @@ impl App {
     }
 
     fn tab_brain(&mut self, ui: &mut egui::Ui, accent: Color32) {
-        heading(ui, "Brain (Needle 3)", accent);
-        section(ui, "Speed vs. smarts", |ui| {
-            ui.add(egui::Slider::new(&mut self.cfg.needle_depth, 6..=20).text("Needle depth (layers)"));
-            hint(ui, "20 = full model (best). 12 ≈ 35% faster with nearly the same accuracy. Below 8 it starts making mistakes.");
-            ui.checkbox(&mut self.cfg.instant_commands, "Instant commands — skip the model for obvious requests like \"open chrome\"");
-            ui.checkbox(&mut self.cfg.search_when_app_missing, "If an app isn't installed, search the web for it");
-        });
-        section(ui, "Performance", |ui| {
+        let _ = accent;
+        let model = nv_core::paths::models_dir().join(nv_core::NEEDLE_MODEL);
+        ui::card_rows(ui, "Needle 3", "The model that reads the command and picks the functions", |ui| {
+            ui::row(ui, "Status", "", |ui| {
+                if model.exists() {
+                    let mb = std::fs::metadata(&model).map(|m| m.len() / (1024 * 1024)).unwrap_or(0);
+                    ui::pill(ui, &format!("installed · {mb} MB"), ui::theme(ui).ok);
+                } else {
+                    ui::pill(ui, "not installed", ui::theme(ui).danger);
+                }
+            });
+            ui::row(ui, "Depth", "20 is the whole model; 12 is about a third faster", |ui| {
+                ui.add(egui::Slider::new(&mut self.cfg.needle_depth, 6..=20));
+            });
+            ui::row(ui, "Instant commands", "Skip the model for obvious requests like \"open chrome\"", |ui| {
+                ui::switch(ui, &mut self.cfg.instant_commands, "");
+            });
+            ui::row(ui, "Search when an app is missing", "Otherwise it says it couldn't find it", |ui| {
+                ui::switch(ui, &mut self.cfg.search_when_app_missing, "");
+            });
             let max = std::thread::available_parallelism().map(|n| n.get() as u32).unwrap_or(8);
-            ui.add(egui::Slider::new(&mut self.cfg.threads, 1..=max).text("CPU threads"));
-            ui.add(egui::Slider::new(&mut self.cfg.unload_after_secs, 10..=600).text("Free memory after idle (s)"));
-            hint(ui, "Models are loaded only while needed. Idle, the assistant uses ~40 MB of RAM and almost no CPU.");
+            ui::row(ui, "CPU threads", "Whisper and Needle share these", |ui| {
+                ui.add(egui::Slider::new(&mut self.cfg.threads, 1..=max));
+            });
+            ui::row(ui, "Free memory after", "Models are loaded only while needed", |ui| {
+                ui.add(egui::Slider::new(&mut self.cfg.unload_after_secs, 10..=600).suffix(" s"));
+            });
         });
+        ui::hint(ui, "Idle, the assistant keeps about 45 MB of RAM and one core at ~2%.");
     }
 
     /// Alarms, reminders, to-dos and calendar events.
@@ -846,13 +714,12 @@ impl App {
                     ui.selectable_value(&mut self.new_item.kind, kind, kind.label());
                 }
             });
-            ui.horizontal(|ui| {
-                ui.label("what");
+            ui::row(ui, "What", "", |ui| {
                 ui.add(
                     egui::TextEdit::singleline(&mut self.new_item.text)
                         .hint_text(match self.new_item.kind {
                             ItemKind::Alarm => "wake up",
-                            ItemKind::Reminder => "call mum",
+                            ItemKind::Reminder => "call my mum",
                             ItemKind::Todo => "buy milk",
                             ItemKind::Event => "team lunch",
                         })
@@ -860,13 +727,11 @@ impl App {
                 );
             });
             if self.new_item.kind.timed() {
-                ui.horizontal(|ui| {
-                    ui.label("when");
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.new_item.when)
-                            .hint_text("7:30 am · in 20 minutes · tomorrow at 9 · every monday at 8")
-                            .desired_width(340.0),
-                    );
+                let mut when = self.new_item.when.clone();
+                ui::row(ui, "When", "7:30 am · in 20 minutes · tomorrow at 9 · every monday at 8", |ui| {
+                    if ui.add(egui::TextEdit::singleline(&mut when).desired_width(300.0)).changed() {
+                        self.new_item.when = when.clone();
+                    }
                 });
                 // Say what we understood, as it is typed.
                 if self.new_item.when.trim().is_empty() {
@@ -884,8 +749,7 @@ impl App {
                 }
             }
             if self.new_item.kind.timed() {
-                ui.horizontal(|ui| {
-                    ui.label("repeat");
+                ui::row(ui, "Repeat", "", |ui| {
                     egui::ComboBox::from_id_salt("new-repeat")
                         .width(180.0)
                         .selected_text(self.new_item.repeat.label())
@@ -901,8 +765,7 @@ impl App {
                         });
                 });
             }
-            ui.horizontal(|ui| {
-                ui.label("run a function");
+            ui::row(ui, "Run a function", "Runs when it goes off, e.g. open your work apps", |ui| {
                 egui::ComboBox::from_id_salt("new-action")
                     .width(220.0)
                     .selected_text(if self.new_item.action.is_empty() { "(nothing)" } else { &self.new_item.action })
@@ -912,10 +775,9 @@ impl App {
                             ui.selectable_value(&mut self.new_item.action, name.clone(), pretty_name(name));
                         }
                     });
-                ui.checkbox(&mut self.new_item.chime, "chime");
-                ui.checkbox(&mut self.new_item.speak, "speak");
+                ui::switch(ui, &mut self.new_item.chime, "chime");
+                ui::switch(ui, &mut self.new_item.speak, "speak");
             });
-            hint(ui, "A function runs when it goes off, e.g. an alarm that opens your work apps.");
 
             let needs_time = self.new_item.kind.timed();
             let ready = !self.new_item.text.trim().is_empty()
@@ -970,7 +832,7 @@ impl App {
                 // most people have.
                 ui.horizontal(|ui| {
                     let mut done = item.done;
-                    if ui.checkbox(&mut done, "").on_hover_text("Done").changed() {
+                    if ui::switch(ui, &mut done, "").on_hover_text("Done").changed() {
                         item.done = done;
                         item.fired = done.then_some(now);
                         dirty = true;
@@ -1149,97 +1011,116 @@ impl App {
     /// The tuning numbers, folded away. The defaults suit almost everyone, but
     /// a quiet voice or a noisy room can want more.
     fn wake_advanced(&mut self, ui: &mut egui::Ui) {
-        egui::CollapsingHeader::new("Advanced wake tuning").id_salt("wakeadv").show(ui, |ui| {
-            let automatic = nv_core::wake_model::Tuning::is_automatic(&self.cfg);
-            let mut manual = !automatic;
-            if ui.checkbox(&mut manual, "Set the trigger by hand").changed() {
-                if manual {
-                    let t = nv_core::wake_model::Tuning::automatic(&self.cfg);
-                    self.cfg.wake_score = t.boost;
-                    self.cfg.wake_threshold = t.threshold;
-                } else {
-                    self.cfg.wake_score = 0.0;
-                    self.cfg.wake_threshold = 0.0;
-                }
-            }
-            ui.add_enabled_ui(manual, |ui| {
-                ui.add(egui::Slider::new(&mut self.cfg.wake_score, 0.5..=6.0).text("Keyword boost"));
-                ui.add(egui::Slider::new(&mut self.cfg.wake_threshold, 0.02..=0.9).text("Trigger threshold"));
-                hint(ui, "Higher boost / lower threshold = easier to trigger. If the chime never comes, raise the boost first.");
-                if ui.button("Reset to automatic").clicked() {
-                    self.cfg.wake_score = 0.0;
-                    self.cfg.wake_threshold = 0.0;
-                }
+        ui.add_space(2.0);
+        egui::CollapsingHeader::new(RichText::new("Advanced wake tuning").size(12.5).color(ui::theme(ui).muted))
+            .id_salt("wakeadv")
+            .show(ui, |ui| {
+                let automatic = nv_core::wake_model::Tuning::is_automatic(&self.cfg);
+                let mut manual = !automatic;
+                ui::row(ui, "Set the trigger by hand", "Otherwise the sensitivity slider decides", |ui| {
+                    if ui::switch(ui, &mut manual, "").changed() {
+                        if manual {
+                            let t = nv_core::wake_model::Tuning::automatic(&self.cfg);
+                            self.cfg.wake_score = t.boost;
+                            self.cfg.wake_threshold = t.threshold;
+                        } else {
+                            self.cfg.wake_score = 0.0;
+                            self.cfg.wake_threshold = 0.0;
+                        }
+                    }
+                });
+                ui.add_enabled_ui(manual, |ui| {
+                    ui::row(ui, "Keyword boost", "Higher is easier to trigger", |ui| {
+                        ui.add(egui::Slider::new(&mut self.cfg.wake_score, 0.5..=6.0));
+                    });
+                    ui::row(ui, "Trigger threshold", "Lower is easier to trigger", |ui| {
+                        ui.add(egui::Slider::new(&mut self.cfg.wake_threshold, 0.02..=0.9));
+                    });
+                    ui.horizontal(|ui| {
+                        ui.add_space(14.0);
+                        if ui::ghost(ui, "Reset to automatic").clicked() {
+                            self.cfg.wake_score = 0.0;
+                            self.cfg.wake_threshold = 0.0;
+                        }
+                        let t = nv_core::wake_model::Tuning::for_config(&self.cfg);
+                        ui.label(
+                            RichText::new(format!("now: boost {:.2}, threshold {:.3}", t.boost, t.threshold))
+                                .size(11.5)
+                                .color(ui::theme(ui).faint),
+                        );
+                    });
+                    ui.add_space(6.0);
+                });
             });
-            let t = nv_core::wake_model::Tuning::for_config(&self.cfg);
-            hint(ui, &format!("Currently: boost {:.2}, threshold {:.3}", t.boost, t.threshold));
-        });
     }
 
-    /// What the spotter is actually listening for, straight from the tokeniser.
+    /// What the spotter is listening for, straight from the tokeniser.
     fn wake_preview(&self, ui: &mut egui::Ui) {
-        let Some(bpe) = &self.bpe else {
-            ui.label(
-                RichText::new("Wake-word model not installed — the assistant is falling back to slower, less reliable detection.")
-                    .color(Color32::from_rgb(255, 170, 80)),
-            );
-            return;
-        };
+        let t = ui::theme(ui);
+        let Some(bpe) = &self.bpe else { return };
         let phrases = nv_core::wake_model::wake_phrases(&self.cfg);
-        hint(ui, &format!("Listening for: {}", phrases.join(", ")));
-        // Showed the way sherpa writes tokens, with a leading space for a word start.
-        let tokens = nv_core::wake_model::keyword_lines(&self.cfg, bpe).replace('▁', " ").replace('\n', "  |  ");
-        ui.label(RichText::new(format!("It listens for: {tokens}")).small().monospace().color(Color32::from_gray(150)));
+        ui::row(ui, "Answers to", "", |ui| {
+            ui.label(RichText::new(phrases.join("  ·  ")).size(12.5).color(t.text));
+        });
         let odd = nv_core::wake_model::unpronounceable(&self.cfg, bpe);
         if !odd.is_empty() {
-            ui.label(
-                RichText::new(format!(
-                    "The model has no sound for {} — waking will be unreliable. Try a simpler name.",
-                    odd.join(", ")
-                ))
-                .color(Color32::from_rgb(255, 170, 80)),
-            );
+            ui::row(ui, "Unpronounceable", "The model has no sound for these", |ui| {
+                ui::pill(ui, &format!("{} — try a simpler name", odd.join(", ")), t.warn);
+            });
         }
+        egui::CollapsingHeader::new(RichText::new("What the model is given").size(11.5).color(t.faint))
+            .id_salt("tokens")
+            .show(ui, |ui| {
+                let tokens = nv_core::wake_model::keyword_lines(&self.cfg, bpe).replace('▁', " ").replace('\n', "\n");
+                ui.add_space(4.0);
+                ui.label(RichText::new(tokens).size(11.0).monospace().color(t.faint));
+            });
     }
 
     /// Install or remove the small keyword model the instant wake-up needs.
     fn wake_model_ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, accent: Color32) {
+        let _ = accent;
         let installed = nv_core::wake_model::is_installed();
+        let t = ui::theme(ui);
         let mut install = false;
         let mut remove = false;
-        section(
+        ui::card_rows(
             ui,
-            if installed { "Wake word — instant" } else { "Wake word — needs the keyword model" },
+            "Wake word",
+            if installed { "Heard the moment you say it, without Whisper" } else { "Needs the small keyword model" },
             |ui| {
+                ui::row(ui, "Spotter", "", |ui| {
+                    if installed {
+                        ui::pill(ui, "instant", t.ok);
+                    } else {
+                        ui::pill(ui, "Whisper fallback", t.warn);
+                    }
+                });
                 if installed {
-                    ui.label(RichText::new("✔ Installed — the name is heard the moment you say it, without Whisper.").color(accent));
+                    self.wake_preview(ui);
                 } else {
-                    ui.label(
-                        RichText::new("Without this, waking waits for Whisper to finish transcribing the whole sentence.")
-                            .color(Color32::from_rgb(255, 170, 80)),
+                    hint(
+                        ui,
+                        "Without it, waking waits for Whisper to finish transcribing the whole sentence. One 5 MB download, then it works offline.",
                     );
-                    hint(ui, "It's a one-time 5 MB download and works offline afterwards.");
                 }
-                self.wake_preview(ui);
                 ui.horizontal(|ui| {
+                    ui.add_space(14.0);
                     if !installed {
                         if let Some(job) = self.job_running("wake_model") {
-                            let p = job.0.lock().unwrap().progress;
-                            ui.add(egui::ProgressBar::new(p.max(0.0)).desired_width(220.0).show_percentage());
-                        } else if ui.button("⬇  Get the wake-word model (5 MB)").clicked() {
+                            let progress = job.0.lock().map(|s| s.progress).unwrap_or(-1.0);
+                            ui.add(egui::ProgressBar::new(progress.max(0.0)).desired_width(200.0).fill(t.accent));
+                        } else if ui::ghost(ui, "Download the wake-word model (5 MB)").clicked() {
                             install = true;
                         }
-                    } else if ui.button("🗑  Remove the wake-word model").clicked() {
+                    } else if ui::ghost(ui, "Remove the model").clicked() {
                         remove = true;
                     }
-                    if ui
-                        .button("🔔  Hear the wake chime")
-                        .on_hover_text("It also pops the bubble and starts listening at the same moment.")
-                        .clicked()
-                    {
+                    if ui::ghost(ui, "Hear the wake chime").clicked() {
                         let _ = win::spawn_detached(&Self::agent_exe(), &["--chime"]);
                     }
                 });
+                ui.add_space(6.0);
             },
         );
         if install {
@@ -1259,63 +1140,210 @@ impl App {
         }
     }
 
-    fn tab_browser(&mut self, ui: &mut egui::Ui, accent: Color32) {
-        heading(ui, "Browser & search", accent);
-        section(ui, "Browser", |ui| {
-            for b in Browser::ALL {
-                ui.radio_value(&mut self.cfg.browser, b, b.label());
-            }
-            if self.cfg.browser == Browser::Custom {
+    fn mic_check_ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, accent: Color32) {
+        let Some(mc) = self.mic_check.as_mut() else { return };
+        mc.tick(ctx, &self.cfg);
+        let wake = self.cfg.wake_phrase();
+        let mut apply: Option<miccheck::Calibration> = None;
+        section(ui, "🎤  Microphone check", |ui| {
+            hint(ui, "Talk and watch the bars — the mic you speak into should jump. Then run the check so NeedleVoice can tune itself to your voice and room.");
+            ui.add_space(4.0);
+            for m in &mc.mics {
+                let lvl = m.level();
+                let frac = ((lvl + 70.0) / 60.0).clamp(0.0, 1.0);
                 ui.horizontal(|ui| {
-                    ui.label("Path to browser .exe");
-                    ui.add(egui::TextEdit::singleline(&mut self.cfg.browser_path).desired_width(360.0));
+                    let mut name = m.name.clone();
+                    if m.is_default {
+                        name.push_str("  (Windows default)");
+                    }
+                    if self.cfg.microphone == m.name || (self.cfg.microphone.is_empty() && m.is_default) {
+                        name.push_str("  ← in use");
+                    }
+                    ui.add_sized([330.0, 18.0], egui::Label::new(RichText::new(name).small()).truncate());
+                    let (rect, _) = ui.allocate_exact_size(egui::vec2(260.0, 12.0), egui::Sense::hover());
+                    let p = ui.painter();
+                    p.rect_filled(rect, 4.0, Color32::from_rgb(28, 31, 40));
+                    let mut fill = rect;
+                    fill.set_width(rect.width() * frac);
+                    p.rect_filled(fill, 4.0, accent);
+                    ui.label(RichText::new(format!("{lvl:>4.0} dB")).monospace().small());
                 });
             }
-            let found = nv_core::actions::browser_exe(&self.cfg);
-            match (&self.cfg.browser, found) {
-                (Browser::Default, _) => hint(ui, "Searches open in your Windows default browser."),
-                (_, Some(p)) => hint(ui, &format!("Found: {}", p.display())),
-                (_, None) => {
-                    ui.label(RichText::new("Not found on this PC — the default browser will be used.").color(Color32::from_rgb(255, 170, 80)));
+            ui.add_space(8.0);
+            match &mc.phase {
+                miccheck::Phase::Idle => {
+                    if ui.add(egui::Button::new(RichText::new("▶  Run microphone check").strong())).clicked() {
+                        mc.start();
+                    }
+                }
+                miccheck::Phase::Quiet(_) => {
+                    let s = miccheck::remaining(&mc.phase).unwrap_or(0.0);
+                    ui.label(RichText::new(format!("Step 1 of 2 — stay quiet… {s:.0}")).size(16.0).color(accent));
+                    hint(ui, "Measuring your room's background noise.");
+                }
+                miccheck::Phase::Speak(_) => {
+                    ui.label(RichText::new(format!("Step 2 of 2 — now say: \"{wake}, open Notepad\"")).size(16.0).strong().color(accent));
+                    hint(ui, "Speak normally, like you would to the assistant. It stops automatically when you finish.");
+                }
+                miccheck::Phase::Analyzing => {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label("Listening back to what you said…");
+                    });
+                }
+            }
+
+            if let Some(cal) = &mc.result {
+                ui.separator();
+                for r in &cal.mics {
+                    let good = cal.best.as_deref() == Some(r.name.as_str());
+                    let text = format!(
+                        "{} {}  — background {:.0} dB, your voice {:.0} dB (+{:.0} dB clearer)",
+                        if good { "✔" } else { "•" },
+                        r.name,
+                        r.noise_db,
+                        r.speech_db,
+                        r.snr().max(0.0)
+                    );
+                    ui.label(RichText::new(text).color(if good { accent } else { Color32::from_gray(150) }));
+                }
+                match &cal.best {
+                    None => {
+                        ui.label(
+                            RichText::new("Couldn't hear you on any microphone.").strong().color(Color32::from_rgb(255, 95, 105)),
+                        );
+                        hint(ui, "Check the mic isn't muted (Windows Settings → System → Sound → Input) and that desktop apps are allowed to use it (Privacy & security → Microphone), then try again.");
+                    }
+                    Some(best) => {
+                        match &cal.transcript {
+                            Some(t) if cal.wake_ok => {
+                                ui.label(RichText::new(format!("✔ Heard: \"{t}\" — wake word recognised!")).strong().color(accent));
+                            }
+                            Some(t) => {
+                                ui.label(RichText::new(format!("Heard: \"{t}\"")).strong());
+                                match cal.sensitivity {
+                                    Some(s) => hint(ui, &format!("The name wasn't recognised at your current sensitivity — it will be raised to {:.2}.", s + 0.05)),
+                                    None => hint(ui, &format!("It didn't catch \"{wake}\". Try again speaking a little slower, or pick a more distinctive name on the General tab.")),
+                                }
+                            }
+                            None => hint(ui, "Couldn't run speech recognition — the levels below will still be applied."),
+                        }
+                        ui.label(format!(
+                            "Recommended: use \"{best}\", boost +{:.0} dB, speech threshold {:.0} dB, noise filtering {}",
+                            cal.gain_db, cal.min_speech_db, cal.vad
+                        ));
+                        if ui.add(egui::Button::new(RichText::new("✔  Apply & save these settings").strong().color(Color32::BLACK)).fill(accent)).clicked() {
+                            apply = Some(cal.clone());
+                        }
+                    }
                 }
             }
         });
-        section(ui, "Search engine", |ui| {
-            ui.horizontal_wrapped(|ui| {
-                for (name, url) in SEARCH_ENGINES {
-                    ui.selectable_value(&mut self.cfg.search_url, url.to_string(), name);
+        if let Some(cal) = apply {
+            if let Some(best) = cal.best {
+                self.cfg.microphone = best;
+            }
+            self.cfg.mic_gain_db = cal.gain_db;
+            self.cfg.min_speech_db = cal.min_speech_db;
+            self.cfg.vad_aggressiveness = cal.vad;
+            if !cal.wake_ok {
+                if let Some(s) = cal.sensitivity {
+                    self.cfg.wake_sensitivity = (s + 0.05).min(1.0);
+                }
+            }
+            self.save();
+        }
+    }
+
+    fn tab_browser(&mut self, ui: &mut egui::Ui, accent: Color32) {
+        let _ = accent;
+        ui::card_rows(ui, "Where links open", "", |ui| {
+            ui::row(ui, "Which browser", "", |ui| {
+                let mut browser = self.cfg.browser;
+                if ui::segmented(ui, &mut browser, &Browser::ALL.map(|b| (b, b.label()))) {
+                    self.cfg.browser = browser;
                 }
             });
-            ui.horizontal(|ui| {
-                ui.label("Custom URL");
-                ui.add(egui::TextEdit::singleline(&mut self.cfg.search_url).desired_width(380.0));
+            if self.cfg.browser == Browser::Custom {
+                ui::row(ui, "Path to the .exe", "", |ui| {
+                    ui::text_field(ui, &mut self.cfg.browser_path, r"C:\Program Files\...", 320.0);
+                });
+            }
+            match (&self.cfg.browser, nv_core::actions::browser_exe(&self.cfg)) {
+                (Browser::Default, _) => {
+                    ui::row(ui, "Status", "", |ui| {
+                        ui::pill(ui, "Windows default", ui::theme(ui).muted);
+                    });
+                }
+                (_, Some(found)) => {
+                    let name = found.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+                    ui::row(ui, "Found", &found.display().to_string(), |ui| {
+                        ui::pill(ui, &name, ui::theme(ui).ok);
+                    });
+                }
+                (_, None) => {
+                    ui::row(ui, "Found", "The default browser will be used instead", |ui| {
+                        ui::pill(ui, "not on this PC", ui::theme(ui).warn);
+                    });
+                }
+            }
+        });
+
+        ui::card(ui, "Search engine", "Used for questions and \"search for ...\"", |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing = egui::vec2(6.0, 6.0);
+                for (name, url) in SEARCH_ENGINES {
+                    let selected = self.cfg.search_url == *url;
+                    let text = RichText::new(name.to_string()).size(12.5).color(if selected {
+                        ui::theme(ui).on_accent
+                    } else {
+                        ui::theme(ui).muted
+                    });
+                    let button = egui::Button::new(text)
+                        .fill(if selected { ui::theme(ui).accent } else { ui::theme(ui).inset })
+                        .stroke(ui::theme(ui).hairline())
+                        .corner_radius(egui::CornerRadius::same(8))
+                        .min_size(egui::vec2(0.0, 26.0));
+                    if ui.add(button).clicked() {
+                        self.cfg.search_url = url.to_string();
+                    }
+                }
             });
-            hint(ui, "{} is replaced with what you asked, e.g. \"what is the haber process\".");
+            ui.add_space(10.0);
+            ui::field(ui, "Address", "{} is replaced with what you asked", |ui| {
+                ui::text_field(ui, &mut self.cfg.search_url, "https://...?q={}", 420.0);
+            });
         });
     }
 
     fn tab_apps(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, accent: Color32) {
-        heading(ui, "Apps", accent);
+        let _ = accent;
         let mut rescan = false;
-        section(ui, "Custom names", |ui| {
-            hint(ui, "Teach it your own words: say \"open code\" for Visual Studio Code. Targets can also be a URL or a path.");
+        ui::card_rows(ui, "Custom names", "Say \"open code\" for Visual Studio Code", |ui| {
             let mut remove = None;
             for (i, a) in self.cfg.aliases.iter().enumerate() {
-                ui.horizontal(|ui| {
-                    ui.label(format!("\"{}\"  →  {}", a.phrase, a.target));
-                    if ui.small_button("✖").clicked() {
-                        remove = Some(i);
-                    }
+                let (phrase, target) = (a.phrase.clone(), a.target.clone());
+                ui::row(ui, &format!("\"{phrase}\""), "", |ui| {
+                    ui.label(RichText::new(target).size(13.0).color(ui::theme(ui).muted));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui::icon_button(ui, ui::ICON_DELETE, "Remove").clicked() {
+                            remove = Some(i);
+                        }
+                    });
                 });
             }
             if let Some(i) = remove {
                 self.cfg.aliases.remove(i);
             }
             ui.horizontal(|ui| {
-                ui.add(egui::TextEdit::singleline(&mut self.new_alias.0).hint_text("when I say…").desired_width(140.0));
-                ui.label("→");
-                ui.add(egui::TextEdit::singleline(&mut self.new_alias.1).hint_text("open this app / URL").desired_width(220.0));
-                if ui.button("Add").clicked() && !self.new_alias.0.trim().is_empty() && !self.new_alias.1.trim().is_empty() {
+                ui.add_space(14.0);
+                ui::text_field(ui, &mut self.new_alias.0, "when I say...", 150.0);
+                ui::glyph(ui, ui::ICON_CHEVRON_RIGHT, 12.0, ui::theme(ui).faint);
+                ui::text_field(ui, &mut self.new_alias.1, "this app, URL or path", 250.0);
+                if ui::ghost(ui, "Add").clicked()
+                    && !self.new_alias.0.trim().is_empty()
+                    && !self.new_alias.1.trim().is_empty()
+                {
                     self.cfg.aliases.push(Alias {
                         phrase: self.new_alias.0.trim().to_lowercase(),
                         target: self.new_alias.1.trim().into(),
@@ -1323,31 +1351,56 @@ impl App {
                     self.new_alias = Default::default();
                 }
             });
+            ui.add_space(6.0);
         });
-        section(ui, &format!("Detected apps ({})", self.apps.apps.len()), |ui| {
+
+        let filter = self.app_filter.to_lowercase();
+        let shown = self.apps.apps.iter().filter(|a| a.name.to_lowercase().contains(&filter)).count();
+        let total = self.apps.apps.len();
+        let scanning = self.job_running("scan").is_some();
+        let mut toggled: Vec<(String, bool)> = Vec::new();
+        ui::card(ui, &format!("Detected apps ({total})"), "New ones are picked up every 30 minutes", |ui| {
             ui.horizontal(|ui| {
-                ui.add(egui::TextEdit::singleline(&mut self.app_filter).hint_text("🔍 filter").desired_width(220.0));
-                if self.job_running("scan").is_some() {
+                ui::glyph(ui, ui::ICON_SEARCH, 13.0, ui::theme(ui).faint);
+                ui::text_field(ui, &mut self.app_filter, "filter", 200.0);
+                if scanning {
                     ui.spinner();
-                } else if ui.button("🔄 Rescan now").clicked() {
+                    ui.label(RichText::new("scanning...").size(12.0).color(ui::theme(ui).muted));
+                } else if ui::ghost(ui, "Rescan now").clicked() {
                     rescan = true;
                 }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(
+                        RichText::new(format!("{shown} shown, untick to hide from voice"))
+                            .size(11.5)
+                            .color(ui::theme(ui).faint),
+                    );
+                });
             });
-            hint(ui, "Untick an app to stop it being opened by voice. New apps are picked up automatically every 30 minutes.");
-            let filter = self.app_filter.to_lowercase();
-            egui::ScrollArea::vertical().max_height(380.0).id_salt("apps").show(ui, |ui| {
+            ui.add_space(8.0);
+            let excluded = self.cfg.excluded_apps.clone();
+            egui::ScrollArea::vertical().max_height(340.0).id_salt("apps").show(ui, |ui| {
+                ui.spacing_mut().item_spacing.y = 4.0;
                 for app in self.apps.apps.iter().filter(|a| a.name.to_lowercase().contains(&filter)) {
-                    let mut enabled = !self.cfg.excluded_apps.iter().any(|e| e.eq_ignore_ascii_case(&app.name));
-                    if ui.checkbox(&mut enabled, &app.name).changed() {
-                        if enabled {
-                            self.cfg.excluded_apps.retain(|e| !e.eq_ignore_ascii_case(&app.name));
-                        } else {
-                            self.cfg.excluded_apps.push(app.name.clone());
+                    let name = app.name.clone();
+                    let mut on = !excluded.iter().any(|e| e.eq_ignore_ascii_case(&name));
+                    ui.horizontal(|ui| {
+                        if ui::switch(ui, &mut on, "").changed() {
+                            toggled.push((name.clone(), on));
                         }
-                    }
+                        let colour = if on { ui::theme(ui).text } else { ui::theme(ui).faint };
+                        ui.label(RichText::new(&name).size(13.0).color(colour));
+                    });
                 }
             });
         });
+        for (name, on) in toggled {
+            if on {
+                self.cfg.excluded_apps.retain(|e| !e.eq_ignore_ascii_case(&name));
+            } else {
+                self.cfg.excluded_apps.push(name);
+            }
+        }
         if rescan {
             let cfg = self.cfg.clone();
             self.start_job(ctx, "scan", "Scanning apps", move |_| {
@@ -1362,51 +1415,82 @@ impl App {
     /// Everything Needle is allowed to do: the built-ins it may call, and the
     /// functions you wrote yourself.
     fn tab_functions(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, accent: Color32) {
-        heading(ui, "Functions", accent);
-        hint(
-            ui,
-            "These are the things Needle can actually do. Untick one to take it away; add your own at the bottom.",
-        );
+        let _ = ctx;
         self.python_ui(ui);
 
         let off = self.cfg.disabled_tools.len();
-        let title = if off == 0 {
-            format!("Built-in functions ({})", tools::BUILTINS.len())
-        } else {
-            format!("Built-in functions ({}/{} on)", tools::BUILTINS.len() - off, tools::BUILTINS.len())
-        };
-        section(ui, &title, |ui| {
-            hint(ui, "Each one is understood instantly — no waiting for the model.");
-            for group in tools::GROUPS {
-                let items: Vec<&'static tools::Builtin> = tools::BUILTINS.iter().filter(|t| t.group == group).collect();
-                let disabled = items.iter().filter(|t| self.cfg.disabled_tools.iter().any(|d| d == t.name)).count();
-                let header = if disabled == 0 {
-                    format!("{group} — {} available", items.len())
-                } else {
-                    format!("{group} — {} on, {disabled} off", items.len() - disabled)
-                };
-                egui::CollapsingHeader::new(header).id_salt(group).default_open(true).show(ui, |ui| {
-                    for t in items {
-                        let mut on = !self.cfg.disabled_tools.iter().any(|d| d == t.name);
+        let on = tools::BUILTINS.len() - off;
+        let t = ui::theme(ui);
+        ui::card_rows(
+            ui,
+            "Built-in functions",
+            "Understood instantly, without waiting for the model",
+            |ui| {
+                ui.horizontal(|ui| {
+                    ui.add_space(14.0);
+                    ui::pill(ui, &format!("{on} on"), if off == 0 { t.ok } else { t.warn });
+                    if off > 0 {
+                        ui::pill(ui, &format!("{off} off"), t.muted);
+                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.label(
+                            RichText::new("Untick one to take it away")
+                                .size(11.5)
+                                .color(t.faint),
+                        );
+                    });
+                });
+                ui.add_space(10.0);
+                egui::ScrollArea::vertical().max_height(430.0).id_salt("builtins").show(ui, |ui| {
+                    for group in tools::GROUPS {
+                        let items: Vec<&'static tools::Builtin> =
+                            tools::BUILTINS.iter().filter(|t| t.group == group).collect();
+                        let off_here = items.iter().filter(|t| self.cfg.disabled_tools.iter().any(|d| d == t.name)).count();
                         ui.horizontal(|ui| {
-                            let box_resp = ui.checkbox(&mut on, pretty_name(t.name));
-                            box_resp.clone().on_hover_text(format!("Needle calls this {}", t.name));
-                            if box_resp.changed() {
-                                if on {
-                                    self.cfg.disabled_tools.retain(|d| d != t.name);
+                            ui.add_space(14.0);
+                            ui.label(RichText::new(group.to_uppercase()).size(10.5).strong().color(t.faint));
+                            ui.label(
+                                RichText::new(if off_here == 0 {
+                                    format!("{} available", items.len())
                                 } else {
-                                    self.cfg.disabled_tools.push(t.name.to_string());
+                                    format!("{} on, {off_here} off", items.len() - off_here)
+                                })
+                                .size(10.5)
+                                .color(t.faint),
+                            );
+                        });
+                        ui.add_space(4.0);
+                        for tool in items {
+                            let mut enabled = !self.cfg.disabled_tools.iter().any(|d| d == tool.name);
+                            ui.horizontal(|ui| {
+                                ui.add_space(14.0);
+                                if ui::switch(ui, &mut enabled, "").changed() {
+                                    if enabled {
+                                        self.cfg.disabled_tools.retain(|d| d != tool.name);
+                                    } else {
+                                        self.cfg.disabled_tools.push(tool.name.to_string());
+                                    }
                                 }
-                            }
-                            ui.label(RichText::new(format!("e.g. \"{}\"", t.example)).small().color(Color32::from_gray(130)));
-                        });
-                        ui.indent(t.name, |ui| {
-                            hint(ui, t.description);
-                        });
+                                let colour = if enabled { t.text } else { t.faint };
+                                ui.label(RichText::new(pretty_name(tool.name)).size(13.0).color(colour))
+                                    .on_hover_text(format!("Needle calls this {}", tool.name));
+                                ui.label(
+                                    RichText::new(format!("\"{}\"", tool.example))
+                                        .size(11.5)
+                                        .color(t.faint),
+                                );
+                            });
+                            ui.horizontal(|ui| {
+                                ui.add_space(66.0);
+                                ui.label(RichText::new(tool.description).size(11.5).color(t.muted));
+                            });
+                            ui.add_space(6.0);
+                        }
+                        ui.add_space(6.0);
                     }
                 });
-            }
-        });
+            },
+        );
 
         // ── your own functions ──────────────────────────────────────────
         let mut delete: Option<usize> = None;
@@ -1436,7 +1520,7 @@ impl App {
                     .default_open(true)
                     .show(ui, |ui| {
                         ui.horizontal(|ui| {
-                            ui.checkbox(&mut tool.enabled, "Enabled");
+                            ui::switch(ui, &mut tool.enabled, "Enabled");
                             ui.separator();
                             ui.label("name");
                             ui.add(egui::TextEdit::singleline(&mut tool.name).desired_width(150.0));
@@ -1764,177 +1848,45 @@ impl App {
     }
 }
 
-fn main() -> eframe::Result {
-    let args: Vec<String> = std::env::args().collect();
-    // `--miccheck`: run the microphone check with no window and write the
-    // result to %APPDATA%\NeedleVoice\miccheck.txt. Useful on a machine whose
-    // audio needs diagnosing, and it exercises the whole wizard — opening the
-    // microphones, both steps and the analysis — without a UI to click.
-    if args.iter().any(|a| a == "--miccheck") {
-        let cfg = Config::load();
-        let ctx = egui::Context::default();
-        let started = std::time::Instant::now();
-        let body = match miccheck::run_to_completion(&cfg, &ctx, Duration::from_secs(45)) {
-            Ok(cal) => miccheck::describe(&cal),
-            Err(e) => format!("{e}\n"),
-        };
-        let text = format!(
-            "NeedleVoice microphone check — {} (took {:.1}s)\n\n{body}",
-            Stamp::now().date() + " " + &Stamp::now().clock(),
-            started.elapsed().as_secs_f32()
-        );
-        let path = nv_core::paths::data_dir().join("miccheck.txt");
-        let _ = std::fs::write(&path, &text);
-        log::info!("mic check written to {}", path.display());
-        return Ok(());
-    }
+fn heading(_ui: &mut egui::Ui, _text: &str, _accent: Color32) {}
 
-    let opts = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_title("NeedleVoice Settings")
-            .with_inner_size([980.0, 720.0])
-            .with_min_inner_size([760.0, 520.0]),
-        ..Default::default()
-    };
-    eframe::run_native("NeedleVoice Settings", opts, Box::new(|cc| Ok(Box::new(App::new(cc)))))
+fn phrases_field(ui: &mut egui::Ui, draft: &mut String, stored: &mut Vec<String>) -> egui::Response {
+    let response = ui.add(egui::TextEdit::multiline(draft).desired_rows(3).desired_width(400.0));
+    if response.changed() {
+        *stored = draft.lines().map(|l| l.trim().to_lowercase()).filter(|l| !l.is_empty()).collect();
+    }
+    response
 }
 
-/// Segoe UI for text, with Windows' symbol/emoji fonts as fallbacks so icons render.
-fn install_fonts(ctx: &egui::Context) {
-    let windir = std::env::var("WINDIR").unwrap_or_else(|_| r"C:\Windows".into());
-    let mut fonts = egui::FontDefinitions::default();
-    let mut add = |name: &str, file: &str, primary: bool| {
-        if let Ok(bytes) = std::fs::read(format!(r"{windir}\Fonts\{file}")) {
-            fonts.font_data.insert(name.into(), std::sync::Arc::new(egui::FontData::from_owned(bytes)));
-            let list = fonts.families.entry(egui::FontFamily::Proportional).or_default();
-            if primary {
-                list.insert(0, name.into());
-            } else {
-                list.push(name.into());
-            }
-        }
-    };
-    add("segoe", "segoeui.ttf", true);
-    add("segoe-symbol", "seguisym.ttf", false);
-    add("segoe-emoji", "seguiemj.ttf", false);
-    ctx.set_fonts(fonts);
+fn accent32((r, g, b): (f32, f32, f32)) -> Color32 {
+    Color32::from_rgb((r * 255.0) as u8, (g * 255.0) as u8, (b * 255.0) as u8)
 }
 
-impl App {
-    fn mic_check_ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, accent: Color32) {
-        let Some(mc) = self.mic_check.as_mut() else { return };
-        mc.tick(ctx, &self.cfg);
-        let wake = self.cfg.wake_phrase();
-        let mut apply: Option<miccheck::Calibration> = None;
-        section(ui, "🎤  Microphone check", |ui| {
-            hint(ui, "Talk and watch the bars — the mic you speak into should jump. Then run the check so NeedleVoice can tune itself to your voice and room.");
-            ui.add_space(4.0);
-            for m in &mc.mics {
-                let lvl = m.level();
-                let frac = ((lvl + 70.0) / 60.0).clamp(0.0, 1.0);
-                ui.horizontal(|ui| {
-                    let mut name = m.name.clone();
-                    if m.is_default {
-                        name.push_str("  (Windows default)");
-                    }
-                    if self.cfg.microphone == m.name || (self.cfg.microphone.is_empty() && m.is_default) {
-                        name.push_str("  ← in use");
-                    }
-                    ui.add_sized([330.0, 18.0], egui::Label::new(RichText::new(name).small()).truncate());
-                    let (rect, _) = ui.allocate_exact_size(egui::vec2(260.0, 12.0), egui::Sense::hover());
-                    let p = ui.painter();
-                    p.rect_filled(rect, 4.0, Color32::from_rgb(28, 31, 40));
-                    let mut fill = rect;
-                    fill.set_width(rect.width() * frac);
-                    p.rect_filled(fill, 4.0, accent);
-                    ui.label(RichText::new(format!("{lvl:>4.0} dB")).monospace().small());
-                });
-            }
-            ui.add_space(8.0);
-            match &mc.phase {
-                miccheck::Phase::Idle => {
-                    if ui.add(egui::Button::new(RichText::new("▶  Run microphone check").strong())).clicked() {
-                        mc.start();
-                    }
-                }
-                miccheck::Phase::Quiet(_) => {
-                    let s = miccheck::remaining(&mc.phase).unwrap_or(0.0);
-                    ui.label(RichText::new(format!("Step 1 of 2 — stay quiet… {s:.0}")).size(16.0).color(accent));
-                    hint(ui, "Measuring your room's background noise.");
-                }
-                miccheck::Phase::Speak(_) => {
-                    ui.label(RichText::new(format!("Step 2 of 2 — now say: \"{wake}, open Notepad\"")).size(16.0).strong().color(accent));
-                    hint(ui, "Speak normally, like you would to the assistant. It stops automatically when you finish.");
-                }
-                miccheck::Phase::Analyzing => {
-                    ui.horizontal(|ui| {
-                        ui.spinner();
-                        ui.label("Listening back to what you said…");
-                    });
-                }
-            }
-
-            if let Some(cal) = &mc.result {
-                ui.separator();
-                for r in &cal.mics {
-                    let good = cal.best.as_deref() == Some(r.name.as_str());
-                    let text = format!(
-                        "{} {}  — background {:.0} dB, your voice {:.0} dB (+{:.0} dB clearer)",
-                        if good { "✔" } else { "•" },
-                        r.name,
-                        r.noise_db,
-                        r.speech_db,
-                        r.snr().max(0.0)
-                    );
-                    ui.label(RichText::new(text).color(if good { accent } else { Color32::from_gray(150) }));
-                }
-                match &cal.best {
-                    None => {
-                        ui.label(
-                            RichText::new("Couldn't hear you on any microphone.").strong().color(Color32::from_rgb(255, 95, 105)),
-                        );
-                        hint(ui, "Check the mic isn't muted (Windows Settings → System → Sound → Input) and that desktop apps are allowed to use it (Privacy & security → Microphone), then try again.");
-                    }
-                    Some(best) => {
-                        match &cal.transcript {
-                            Some(t) if cal.wake_ok => {
-                                ui.label(RichText::new(format!("✔ Heard: \"{t}\" — wake word recognised!")).strong().color(accent));
-                            }
-                            Some(t) => {
-                                ui.label(RichText::new(format!("Heard: \"{t}\"")).strong());
-                                match cal.sensitivity {
-                                    Some(s) => hint(ui, &format!("The name wasn't recognised at your current sensitivity — it will be raised to {:.2}.", s + 0.05)),
-                                    None => hint(ui, &format!("It didn't catch \"{wake}\". Try again speaking a little slower, or pick a more distinctive name on the General tab.")),
-                                }
-                            }
-                            None => hint(ui, "Couldn't run speech recognition — the levels below will still be applied."),
-                        }
-                        ui.label(format!(
-                            "Recommended: use \"{best}\", boost +{:.0} dB, speech threshold {:.0} dB, noise filtering {}",
-                            cal.gain_db, cal.min_speech_db, cal.vad
-                        ));
-                        if ui.add(egui::Button::new(RichText::new("✔  Apply & save these settings").strong().color(Color32::BLACK)).fill(accent)).clicked() {
-                            apply = Some(cal.clone());
-                        }
-                    }
-                }
-            }
-        });
-        if let Some(cal) = apply {
-            if let Some(best) = cal.best {
-                self.cfg.microphone = best;
-            }
-            self.cfg.mic_gain_db = cal.gain_db;
-            self.cfg.min_speech_db = cal.min_speech_db;
-            self.cfg.vad_aggressiveness = cal.vad;
-            if !cal.wake_ok {
-                if let Some(s) = cal.sensitivity {
-                    self.cfg.wake_sensitivity = (s + 0.05).min(1.0);
-                }
-            }
-            self.save();
-        }
+fn pretty_name(s: &str) -> String {
+    let spaced = s.replace('_', " ");
+    let mut chars = spaced.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().chain(chars).collect(),
+        None => spaced,
     }
+}
+
+fn hint(ui: &mut egui::Ui, text: &str) {
+    ui::hint(ui, text);
+}
+
+fn section(ui: &mut egui::Ui, title: &str, body: impl FnOnce(&mut egui::Ui)) {
+    ui::card(ui, title, "", body);
+}
+
+fn orb(ui: &egui::Ui, rect: egui::Rect, c: Color32) {
+    let p = ui.painter();
+    let center = rect.center();
+    let r = rect.width().min(rect.height()) / 2.0;
+    p.circle_filled(center, r, c.linear_multiply(0.18));
+    p.circle_filled(center, r * 0.78, Color32::from_rgb(10, 11, 16));
+    p.circle_filled(center + egui::vec2(-r * 0.2, -r * 0.15), r * 0.42, c.linear_multiply(0.75));
+    p.circle_stroke(center, r * 0.78, Stroke::new(1.6, c));
 }
 
 #[cfg(test)]
@@ -2015,4 +1967,41 @@ mod typing_tests {
         assert_eq!(stored.len(), 2);
         assert!(draft.ends_with('\n'), "{draft:?}");
     }
+}
+
+fn main() -> eframe::Result {
+    let args: Vec<String> = std::env::args().collect();
+    // `--miccheck`: run the microphone check with no window and write the
+    // result to %APPDATA%\NeedleVoice\miccheck.txt. Useful on a machine whose
+    // audio needs diagnosing, and it exercises the whole wizard — opening the
+    // microphones, both steps and the analysis — without a UI to click.
+    if args.iter().any(|a| a == "--miccheck") {
+        let cfg = Config::load();
+        let ctx = egui::Context::default();
+        let started = std::time::Instant::now();
+        let body = match miccheck::run_to_completion(&cfg, &ctx, Duration::from_secs(45)) {
+            Ok(cal) => miccheck::describe(&cal),
+            Err(e) => format!("{e}\n"),
+        };
+        let text = format!(
+            "NeedleVoice microphone check — {} (took {:.1}s)\n\n{body}",
+            Stamp::now().date() + " " + &Stamp::now().clock(),
+            started.elapsed().as_secs_f32()
+        );
+        let path = nv_core::paths::data_dir().join("miccheck.txt");
+        let _ = std::fs::write(&path, &text);
+        log::info!("mic check written to {}", path.display());
+        return Ok(());
+    }
+
+    let opts = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_title("NeedleVoice Settings")
+            // The window draws its own title bar, so the frame is ours.
+            .with_decorations(false)
+            .with_inner_size([1020.0, 740.0])
+            .with_min_inner_size([880.0, 580.0]),
+        ..Default::default()
+    };
+    eframe::run_native("NeedleVoice Settings", opts, Box::new(|cc| Ok(Box::new(App::new(cc)))))
 }

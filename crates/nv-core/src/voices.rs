@@ -22,6 +22,15 @@ pub enum Engine {
 impl Engine {
     pub const ALL: [Engine; 3] = [Engine::Piper, Engine::Kokoro, Engine::System];
 
+    /// Short label for a segmented control.
+    pub fn label_short(self) -> &'static str {
+        match self {
+            Engine::Piper => "Natural",
+            Engine::Kokoro => "Ultra-realistic",
+            Engine::System => "Windows built-in",
+        }
+    }
+
     pub fn label(self) -> &'static str {
         match self {
             Engine::Piper => "Natural (Piper) — fast",
