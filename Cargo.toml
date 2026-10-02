@@ -5,6 +5,7 @@ members = ["crates/nv-core", "crates/nv-agent", "crates/nv-config", "crates/nv-s
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
+license = "MIT"
 
 [profile.release]
 opt-level = 3

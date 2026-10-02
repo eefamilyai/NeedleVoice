@@ -1,7 +1,12 @@
 # Credits and third-party licences
 
-NeedleVoice is a thin layer of glue around other people's work. Everything below
-is used as published, with the licence it came with.
+NeedleVoice's own code is MIT — see [LICENSE](LICENSE).
+
+It is a thin layer of glue around other people's work, though, and everything
+below is used as published, with the licence it came with. This file is also the
+NOTICE that the Apache-2.0 components ask for: their licences and authors are
+recorded here, and the models themselves are downloaded from their publishers
+rather than redistributed in this repository.
 
 ## The brain: Needle 3
 

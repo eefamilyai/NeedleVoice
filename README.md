@@ -131,6 +131,12 @@ crates/nv-config  settings UI (egui)
 crates/nv-setup   installer/uninstaller with embedded zstd payload
 ```
 
+## Licence
+
+MIT — see [LICENSE](LICENSE). The models and libraries this project is built on
+keep their own licences; [CREDITS.md](CREDITS.md) lists them, and doubles as the
+NOTICE that Apache-2.0 components (Needle 3, sherpa-onnx) ask for.
+
 ## Credits
 
 The interesting parts of this project belong to other people. The tool calling

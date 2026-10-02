@@ -2,6 +2,7 @@
 name = "nv-core"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 
 [dependencies]
 needle-infer = { version = "0.3.1", features = ["parallel"] }
