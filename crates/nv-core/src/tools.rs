@@ -85,6 +85,16 @@ pub const BUILTINS: &[Builtin] = &[
       &["close this window", "close the window", "close the current window", "close this tab"]),
     b("open_settings", "System", "Open Windows Settings", &[], "open windows settings",
       &["open settings", "open windows settings", "open the settings app", "open system settings"]),
+    b("disengage", "System", "Stop listening and forget what was just said", &[], "never mind",
+      &["never mind", "nevermind", "never mind that", "never mind it", "never mind then", "forget it",
+        "forget that", "forget about it", "cancel", "cancel that", "cancel it", "scrap that", "disregard",
+        "disregard that", "ignore that", "ignore it", "i changed my mind", "changed my mind", "no thanks",
+        "no thank you", "thats all", "thats it", "thats everything", "were done", "we are done", "abort",
+        "abort that", "as you were", "stand down", "disengage", "stop listening", "stop listening to me",
+        "you can stop", "you can stop now", "turn off", "turn yourself off", "go back to sleep",
+        "thats enough", "nothing else", "all done", "wait", "wait a second", "wait a moment",
+        "wait wait", "hold on", "hang on", "hold that thought", "give me a second", "give me a moment",
+        "one moment", "nvm", "never mind me"]),
     // ── Answers ────────────────────────────────────────────────────────
     b("tell_time", "Answers", "Tell the current time", &[], "what time is it",
       &["what time is it", "what is the time", "whats the time", "tell me the time", "current time", "the time"]),
@@ -655,6 +665,20 @@ mod tests {
         let v: Value = serde_json::from_str(&tools_json(&cfg)).unwrap();
         assert_eq!(v.as_array().unwrap().len(), BUILTINS.len() - 1);
         assert!(match_any_phrase(&cfg, "pause the music").is_none());
+    }
+
+    /// Disengaging must not steal the commands that share its words.
+    #[test]
+    fn disengaging_does_not_steal_real_commands() {
+        let cfg = Config::default();
+        for command in ["stop the music", "cancel my alarm", "pause the music", "stop media playback"] {
+            let hit = match_any_phrase(&cfg, command).expect(command);
+            assert_ne!(hit.tool, "disengage", "{command} should not disengage");
+        }
+        for command in ["never mind", "never mind that", "turn off", "disengage", "you can stop now"] {
+            let hit = match_any_phrase(&cfg, command).unwrap_or_else(|| panic!("{command} matched nothing"));
+            assert_eq!(hit.tool, "disengage", "{command}");
+        }
     }
 
     #[test]

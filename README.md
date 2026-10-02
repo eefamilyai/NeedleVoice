@@ -23,7 +23,7 @@ mic ─► 16 kHz ─┬─► keyword spotter (3.3 M params, always on) ─► 
                │      chime + bubble + listening, ~0.3 s after the name
                ▼
           WebRTC VAD ─► Whisper tiny (only on speech) ─► command
-     ─► instant phrase match / Needle 3 tool call ─► any of the 29 built-in
+     ─► instant phrase match / Needle 3 tool call ─► any of the 30 built-in
         functions, or one you wrote yourself
      ─► personality line ─► Piper / Kokoro neural voice
 
@@ -50,6 +50,12 @@ scheduler ─► alarms · reminders · to-dos · calendar events
   run a PowerShell script, or just say something), trigger phrases and a reply.
   Templates for the common ones (shutdown, sleep, Spotify search, night light,
   empty recycle bin, …) are one click away.
+* **Changing your mind**: after the wake word you can back out — "never mind",
+  "forget it", "cancel that", "turn off", "stand down", "stop listening",
+  "I changed my mind", "that's all". The assistant says one short word and goes
+  back to waiting, instead of treating it as a command. The words it shares with
+  real commands keep their meaning: "stop the music" still pauses, "cancel my
+  alarm" still cancels the alarm.
 * **Smarter functions**: besides the one-liners there are two ways to write
   something real. A **Python script** (dropped in the scripts folder) gets your
   parameters as arguments and as `NV_PARAM_*`, and whatever it prints last is

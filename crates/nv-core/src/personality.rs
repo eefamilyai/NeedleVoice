@@ -268,6 +268,13 @@ pub fn line(persona: Persona, moment: &Moment) -> String {
                 Sarcastic => &["Unmuted. Brace yourself.", "Sound on again."],
                 Butler => &["Sound restored.", "Unmuted for you."],
             }),
+            // Short: they just told us to go away.
+            Action::Disengage => pick(match persona {
+                Cheerful => &["Okay!", "No problem!", "Standing by!"],
+                Chill => &["Okay.", "Fair enough.", "Standing by."],
+                Sarcastic => &["Fine. I'll be here.", "Okay, forget I asked.", "Right. Nothing, then."],
+                Butler => &["Very good.", "As you wish.", "Standing by, of course."],
+            }),
             Action::LockPc => pick(match persona {
                 Cheerful => &["Locking up. See you soon!", "Locked! Stay safe."],
                 Chill => &["Locked.", "Locking up."],
@@ -383,6 +390,7 @@ mod tests {
             Action::TellTime,
             Action::TellDate,
             Action::LockPc,
+            Action::Disengage,
             Action::ShowDesktop,
             Action::Screenshot,
             Action::CloseWindow,

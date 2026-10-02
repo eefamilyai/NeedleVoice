@@ -62,6 +62,9 @@ pub fn execute_with(action: &Action, cfg: &Config, apps: &AppIndex, speaker: &dy
         Action::Screenshot => win::screenshot().map(|p| format!("saved a screenshot to {}", p.display())),
         Action::CloseWindow => win::close_foreground_window(),
         Action::OpenSettings => win::shell_open("ms-settings:", None).map(|_| "opened Windows Settings".into()),
+        // Nothing to undo: the listener goes back to waiting on its own. This
+        // just gives the personality something to say.
+        Action::Disengage => Ok("stood down".into()),
         Action::Custom { name, params } => run_custom(cfg, name, params, apps, speaker),
 
         // ── The schedule ───────────────────────────────────────────────
@@ -150,7 +153,15 @@ fn cancel_item(what: &str) -> Result<String, String> {
         schedule.find(what).map(|i| i.id)
     };
     let Some(id) = id else {
-        return Err(format!("couldn't find anything like \"{}\"", what.trim()));
+        return Err(if what.trim().is_empty() {
+            if schedule.items.is_empty() {
+                "there's nothing on your schedule to cancel".to_string()
+            } else {
+                "I couldn't tell which one you meant".to_string()
+            }
+        } else {
+            format!("I couldn't find anything like \"{}\"", what.trim())
+        });
     };
     let removed = schedule.remove(id).unwrap();
     schedule.save().map_err(|e| format!("couldn't save the schedule: {e}"))?;

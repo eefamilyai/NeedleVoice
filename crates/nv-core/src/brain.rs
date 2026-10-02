@@ -56,6 +56,8 @@ pub enum Action {
     Screenshot,
     CloseWindow,
     OpenSettings,
+    /// "Never mind" — stop waiting and forget the command.
+    Disengage,
     /// One of the user's own functions, with the parameters it was given.
     Custom { name: String, params: Vec<(String, String)> },
 
@@ -98,6 +100,7 @@ impl Action {
             Action::Volume(_) => "the volume".into(),
             Action::Mute(_) => "the sound".into(),
             Action::LockPc => "the computer".into(),
+            Action::Disengage => "nothing".into(),
             Action::ShowDesktop => "the desktop".into(),
             Action::Screenshot => "the screenshot".into(),
             Action::CloseWindow => "the window".into(),
@@ -133,6 +136,7 @@ impl std::fmt::Display for Action {
             Action::TellTime => write!(f, "tell the time"),
             Action::TellDate => write!(f, "tell the date"),
             Action::LockPc => write!(f, "lock the pc"),
+            Action::Disengage => write!(f, "disengage"),
             Action::ShowDesktop => write!(f, "show the desktop"),
             Action::Screenshot => write!(f, "take a screenshot"),
             Action::CloseWindow => write!(f, "close the window"),
@@ -288,6 +292,7 @@ pub fn action_from_call(name: &str, args: &Value, cfg: &Config) -> Option<Action
         "tell_time" => Some(Action::TellTime),
         "tell_date" => Some(Action::TellDate),
         "lock_pc" => Some(Action::LockPc),
+        "disengage" => Some(Action::Disengage),
         "show_desktop" => Some(Action::ShowDesktop),
         "screenshot" => Some(Action::Screenshot),
         "close_window" => Some(Action::CloseWindow),
@@ -388,14 +393,45 @@ const TRAILING_FILLER: &[&str] = &[
     "real quick",
 ];
 
-/// Strip politeness, the trailing "right now", the assistant's own name, and
-/// the punctuation Whisper adds.
+/// Words people put in front of a command: "actually, never mind".
+const LEADING_FILLER: &[&str] = &[
+    "can you please",
+    "could you please",
+    "can you",
+    "could you",
+    "would you",
+    "please",
+    "and",
+    "um",
+    "uh",
+    "actually",
+    "well",
+    "hmm",
+    "erm",
+    "ok",
+    "okay",
+    "so",
+    "then",
+    "just",
+];
+
+/// Strip politeness, filler at either end, the assistant's own name, and the
+/// punctuation Whisper adds.
 fn clean_command(s: &str, cfg: &Config) -> String {
-    let mut c = s.trim().trim_end_matches(['.', '!', '?', ',']).trim().to_string();
-    let lower = c.to_lowercase();
-    for p in ["can you please ", "could you please ", "can you ", "could you ", "would you ", "please ", "and ", "um ", "uh "] {
-        if lower.starts_with(p) {
-            c = c[p.len()..].to_string();
+    // Commas are punctuation, not content: "hey, never mind".
+    let mut c = s.trim().trim_end_matches(['.', '!', '?', ',']).replace(',', " ").trim().to_string();
+    let prefixes: Vec<String> = cfg.wake_prefixes.iter().map(|p| fuzzy::normalize(p)).collect();
+    // Leading "actually" / "hey" / "please".
+    loop {
+        let before = c.clone();
+        let lower = c.to_lowercase();
+        for p in LEADING_FILLER.iter().map(|p| p.to_string()).chain(prefixes.iter().cloned()) {
+            if lower.len() > p.len() + 1 && lower.starts_with(&p) && lower.as_bytes()[p.len()] == b' ' {
+                c = c[p.len() + 1..].to_string();
+                break;
+            }
+        }
+        if c == before {
             break;
         }
     }
@@ -416,7 +452,7 @@ fn clean_command(s: &str, cfg: &Config) -> String {
             break;
         }
     }
-    c.trim().to_string()
+    c.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// Words that carry no content in a question about the clock or the date.
@@ -447,6 +483,36 @@ fn asks_only_about(text: &str, cfg: &Config, vocab: &[&str], anchors: &[&str]) -
         if anchors.contains(w) {
             anchored = true;
         } else if vocab.contains(w) || names.iter().any(|n| n.split(' ').any(|part| part == *w)) {
+            continue;
+        } else {
+            return false;
+        }
+    }
+    anchored
+}
+
+/// "hold on a second", "wait a minute", "hang on one tick" — however it is
+/// dressed up, if the whole sentence is waiting-speak they want a pause, not a
+/// search. "pause" is deliberately absent: on its own it means the music.
+const WAITING_WORDS: &[&str] = &[
+    "wait", "waiting", "hold", "hang", "on", "up", "a", "an", "one", "two", "just", "second", "seconds", "sec",
+    "secs", "moment", "minute", "minutes", "min", "mins", "bit", "tick", "please", "there", "then", "now", "for",
+    "me", "give", "gimme", "hold", "off", "not",
+];
+const WAITING_ANCHORS: &[&str] = &["wait", "waiting", "hold", "hang"];
+
+/// Is the whole sentence asking for a moment?
+fn asks_to_wait(text: &str, cfg: &Config) -> bool {
+    let words: Vec<&str> = text.split(' ').filter(|w| !w.is_empty()).collect();
+    if words.is_empty() {
+        return false;
+    }
+    let names: Vec<String> = cfg.wake_names().iter().map(|n| fuzzy::normalize(n)).collect();
+    let mut anchored = false;
+    for w in &words {
+        if WAITING_ANCHORS.contains(w) {
+            anchored = true;
+        } else if WAITING_WORDS.contains(w) || names.iter().any(|n| n.split(' ').any(|part| part == *w)) {
             continue;
         } else {
             return false;
@@ -512,6 +578,11 @@ fn instant(command: &str, cfg: &Config, apps: &AppIndex) -> Option<Vec<Action>> 
             return Some(vec![with_query_text(a, &text)]);
         }
     }
+    // "Hold on a second" and friends, in any wording.
+    if enabled(cfg, "disengage") && asks_to_wait(&text, cfg) {
+        return Some(vec![Action::Disengage]);
+    }
+
     // A question about the schedule, however Whisper spelled the first word
     // ("words on my schedule"). Anything with a setting verb in it was already
     // claimed by the phrase list above, or is left to the model.
@@ -803,6 +874,44 @@ mod tests {
         for q in ["what time does the shop open", "what is the time in new york", "what is the earliest train"] {
             assert_eq!(run(q), Some(vec![Action::WebSearch(q.to_string())]), "{q:?}");
         }
+    }
+
+    /// Backing out after the wake word, in the words people actually use.
+    #[test]
+    fn disengaging() {
+        let mut cfg = Config::default();
+        cfg.agent_name = "Reggie".into();
+        let apps = index();
+        let run = |c: &str| instant(&clean_command(c, &cfg), &cfg, &apps);
+        for command in [
+            "never mind",
+            "nevermind",
+            "Never mind that.",
+            "forget it",
+            "cancel",
+            "cancel that",
+            "i changed my mind",
+            "disengage",
+            "turn off",
+            "stop listening",
+            "you can stop now",
+            "never mind reggie",
+            "stand down",
+            "actually i changed my mind",
+            "wait",
+            "hold on a second",
+            "hang on one tick",
+            "wait a moment please",
+            "give me a second",
+            "hey, never mind",
+            "ok, never mind that",
+        ] {
+            assert_eq!(run(command), Some(vec![Action::Disengage]), "{command:?}");
+        }
+        // The words it shares with real commands still mean those things.
+        assert_eq!(run("stop the music"), Some(vec![Action::Media(MediaKey::Pause)]), "stop the music");
+        assert_eq!(run("stop"), Some(vec![Action::Media(MediaKey::Stop)]), "stop");
+        assert_eq!(run("cancel my alarm"), Some(vec![Action::CancelSchedule { what: String::new() }]));
     }
 
     #[test]
