@@ -1,0 +1,355 @@
+//! Talking back. Neural voices (Piper / Kokoro via sherpa-onnx) or the
+//! built-in Windows voices, on a background thread so listening never blocks.
+//!
+//! The model is loaded when the wake word is heard (while the user is still
+//! speaking the command) and dropped again after a minute of quiet.
+
+use std::collections::VecDeque;
+use std::sync::mpsc::{channel, RecvTimeoutError, Sender};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use nv_core::voices::{self, Engine};
+use nv_core::Config;
+use sherpa_onnx::{GenerationConfig, OfflineTts, OfflineTtsConfig};
+
+use crate::overlay::Shared;
+
+enum Msg {
+    Prepare,
+    Say(String),
+}
+
+pub struct Tts {
+    tx: Option<Sender<Msg>>,
+    shared: Arc<Shared>,
+}
+
+impl Tts {
+    pub fn start(cfg: &Config, shared: Arc<Shared>) -> Tts {
+        if !cfg.voice_enabled {
+            return Tts { tx: None, shared };
+        }
+        let (tx, rx) = channel::<Msg>();
+        let cfg = cfg.clone();
+        let shared2 = shared.clone();
+        let spawned = std::thread::Builder::new().name("tts".into()).spawn(move || {
+            let shared = shared2;
+            nv_core::win::com_init();
+            let idle = Duration::from_secs(cfg.unload_after_secs.max(5));
+            let mut voice: Option<Voice> = None;
+            let mut last_used = Instant::now();
+            loop {
+                match rx.recv_timeout(Duration::from_secs(1)) {
+                    Ok(Msg::Prepare) => {
+                        if voice.is_none() {
+                            voice = Voice::load(&cfg);
+                        }
+                        last_used = Instant::now();
+                    }
+                    Ok(Msg::Say(first)) => {
+                        // If several lines queued up, only the newest is worth saying.
+                        let mut text = first;
+                        for m in rx.try_iter() {
+                            if let Msg::Say(t) = m {
+                                text = t;
+                            }
+                        }
+                        if voice.is_none() {
+                            voice = Voice::load(&cfg);
+                        }
+                        shared.set_speaking(true);
+                        match &voice {
+                            Some(v) => v.speak(&text, &cfg, &shared),
+                            None => log::warn!("no voice available"),
+                        }
+                        shared.set_level(0.0);
+                        shared.set_speaking(false);
+                        last_used = Instant::now();
+                    }
+                    Err(RecvTimeoutError::Timeout) => {
+                        if voice.is_some() && last_used.elapsed() > idle {
+                            voice = None;
+                            log::info!("voice unloaded (idle)");
+                        }
+                    }
+                    Err(RecvTimeoutError::Disconnected) => return,
+                }
+            }
+        });
+        Tts { tx: spawned.ok().map(|_| tx), shared }
+    }
+
+    pub fn active(&self) -> bool {
+        self.tx.is_some()
+    }
+
+    /// Start loading the voice now so the reply isn't delayed later.
+    pub fn prepare(&self) {
+        if let Some(tx) = &self.tx {
+            let _ = tx.send(Msg::Prepare);
+        }
+    }
+
+    pub fn say(&self, text: &str) {
+        if let Some(tx) = &self.tx {
+            log::info!("says: {text:?}");
+            if tx.send(Msg::Say(text.to_string())).is_err() {
+                self.shared.set_speaking(false);
+            }
+        }
+    }
+}
+
+/// The agent's voice behind the trait `nv_core::actions` uses, so a function
+/// can speak mid-sequence instead of only at the end.
+pub struct AgentVoice {
+    tts: Arc<Tts>,
+    shared: Arc<Shared>,
+}
+
+impl AgentVoice {
+    pub fn new(tts: Arc<Tts>, shared: Arc<Shared>) -> Arc<AgentVoice> {
+        Arc::new(AgentVoice { tts, shared })
+    }
+}
+
+impl nv_core::actions::Speaker for AgentVoice {
+    fn say(&self, text: &str) {
+        if text.trim().is_empty() {
+            return;
+        }
+        log::info!("says: {text:?}");
+        // Set speaking before the voice starts so the bubble stays up and the
+        // microphone stays closed while it talks.
+        self.shared.set_speaking(true);
+        self.tts.say(text);
+    }
+}
+
+/// Speak once and return (used by the config app's "Preview voice").
+pub fn speak_once(cfg: &Config, text: &str) {
+    nv_core::win::com_init();
+    let shared = Shared::new();
+    match Voice::load(cfg) {
+        Some(v) => v.speak(text, cfg, &shared),
+        None => log::warn!("preview: voice unavailable"),
+    }
+}
+
+enum Voice {
+    Neural { tts: OfflineTts, sid: i32 },
+    System(nv_core::voice::Speaker),
+}
+
+impl Voice {
+    fn load(cfg: &Config) -> Option<Voice> {
+        let t = Instant::now();
+        let v = match cfg.voice_engine {
+            Engine::System => {
+                let rate = ((cfg.voice_speed - 1.0) * 10.0).round() as i32;
+                nv_core::voice::Speaker::new(&cfg.system_voice, rate, cfg.voice_volume).ok().map(Voice::System)
+            }
+            Engine::Piper => load_piper(&cfg.piper_voice, cfg.threads)
+                .or_else(|| {
+                    log::warn!("Piper voice {} not installed, using default", cfg.piper_voice);
+                    load_piper(voices::DEFAULT_PIPER, cfg.threads)
+                })
+                .map(|tts| Voice::Neural { tts, sid: 0 }),
+            Engine::Kokoro => load_kokoro(&cfg.kokoro_voice, cfg.threads)
+                .or_else(|| {
+                    log::warn!("Kokoro isn't installed, falling back to Piper");
+                    load_piper(&cfg.piper_voice, cfg.threads).map(|tts| (tts, 0))
+                })
+                .map(|(tts, sid)| Voice::Neural { tts, sid }),
+        };
+        // Last resort: the Windows voice is always there.
+        let v = v.or_else(|| nv_core::voice::Speaker::new("", 0, cfg.voice_volume).ok().map(Voice::System));
+        log::info!("voice loaded in {:?}", t.elapsed());
+        v
+    }
+
+    fn speak(&self, text: &str, cfg: &Config, shared: &Arc<Shared>) {
+        match self {
+            Voice::System(s) => s.say(text),
+            Voice::Neural { tts, sid } => {
+                let player = match Player::start(tts.sample_rate() as u32, cfg.voice_volume, shared.clone()) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        log::error!("audio output: {e}");
+                        return;
+                    }
+                };
+                // Each sentence arrives through the callback as soon as it's
+                // synthesised, so playback starts before the whole reply is done.
+                let queue = player.feeder();
+                let pushed = Arc::new(Mutex::new(false));
+                let pushed2 = pushed.clone();
+                let gen = GenerationConfig { sid: *sid, speed: cfg.voice_speed, ..Default::default() };
+                let audio = tts.generate_with_config(
+                    text,
+                    &gen,
+                    Some(move |chunk: &[f32], _progress: f32| {
+                        queue.push(chunk);
+                        *pushed2.lock().unwrap() = true;
+                        true
+                    }),
+                );
+                if !*pushed.lock().unwrap() {
+                    if let Some(a) = &audio {
+                        player.feeder().push(a.samples());
+                    }
+                }
+                player.finish();
+            }
+        }
+    }
+}
+
+fn s(p: &std::path::Path) -> Option<String> {
+    Some(p.to_string_lossy().to_string())
+}
+
+fn load_piper(id: &str, threads: u32) -> Option<OfflineTts> {
+    let dir = voices::pack_dir(id);
+    let model = voices::pack_model(&dir)?;
+    let mut c = OfflineTtsConfig::default();
+    c.model.vits.model = s(&model);
+    c.model.vits.tokens = s(&dir.join("tokens.txt"));
+    c.model.vits.data_dir = s(&dir.join("espeak-ng-data"));
+    c.model.num_threads = threads.min(8) as i32;
+    c.max_num_sentences = 1;
+    OfflineTts::create(&c)
+}
+
+fn load_kokoro(name: &str, threads: u32) -> Option<(OfflineTts, i32)> {
+    let dir = voices::pack_dir(voices::KOKORO_PACK);
+    if !voices::is_installed(voices::KOKORO_PACK) {
+        return None;
+    }
+    let v = voices::kokoro_voice(name);
+    let british = v.name.starts_with('b');
+    let mut c = OfflineTtsConfig::default();
+    c.model.kokoro.model = s(&dir.join("model.onnx"));
+    c.model.kokoro.voices = s(&dir.join("voices.bin"));
+    c.model.kokoro.tokens = s(&dir.join("tokens.txt"));
+    c.model.kokoro.data_dir = s(&dir.join("espeak-ng-data"));
+    c.model.kokoro.lexicon = s(&dir.join(if british { "lexicon-gb-en.txt" } else { "lexicon-us-en.txt" }));
+    c.model.kokoro.lang = Some(if british { "en-gb" } else { "en-us" }.into());
+    c.model.num_threads = threads.min(8) as i32;
+    c.max_num_sentences = 1;
+    OfflineTts::create(&c).map(|t| (t, v.sid))
+}
+
+/// Streams mono samples to the default speakers, resampling to the device
+/// rate, and feeds the bubble the playback loudness.
+struct Player {
+    _stream: cpal::Stream,
+    feeder: Feeder,
+}
+
+#[derive(Clone)]
+struct Feeder {
+    queue: Arc<Mutex<VecDeque<f32>>>,
+    step: f64,
+    state: Arc<Mutex<(f64, f32)>>, // (fractional position, previous sample)
+}
+
+impl Feeder {
+    /// Resample (linear) and enqueue a chunk.
+    fn push(&self, chunk: &[f32]) {
+        let mut st = self.state.lock().unwrap();
+        let (mut pos, mut prev) = *st;
+        let mut out = Vec::with_capacity((chunk.len() as f64 / self.step) as usize + 2);
+        for &x in chunk {
+            while pos <= 1.0 {
+                out.push(prev + (x - prev) * pos as f32);
+                pos += self.step;
+            }
+            pos -= 1.0;
+            prev = x;
+        }
+        *st = (pos, prev);
+        self.queue.lock().unwrap().extend(out);
+    }
+}
+
+impl Player {
+    fn start(src_rate: u32, volume: u8, shared: Arc<Shared>) -> Result<Player, String> {
+        let host = cpal::default_host();
+        let device = host.default_output_device().ok_or("no speakers found")?;
+        let supported = device.default_output_config().map_err(|e| e.to_string())?;
+        let channels = supported.channels() as usize;
+        let rate = supported.sample_rate();
+        let format = supported.sample_format();
+        let config: cpal::StreamConfig = supported.into();
+        let queue = Arc::new(Mutex::new(VecDeque::<f32>::new()));
+        let gain = volume.min(100) as f32 / 100.0;
+
+        let q = queue.clone();
+        let mut env = 0.0f32;
+        let mut fill = move |out: &mut dyn FnMut(usize, f32), frames: usize| {
+            let mut q = q.lock().unwrap();
+            let mut sum = 0.0;
+            for i in 0..frames {
+                let s = q.pop_front().unwrap_or(0.0) * gain;
+                sum += s * s;
+                for c in 0..channels {
+                    out(i * channels + c, s);
+                }
+            }
+            let rms = (sum / frames.max(1) as f32).sqrt();
+            env = env * 0.7 + (rms * 4.0).min(1.0) * 0.3;
+            shared.set_level(env);
+        };
+        let err = |e: cpal::Error| {
+            if e.kind() != cpal::ErrorKind::Xrun {
+                log::error!("playback error: {e}");
+            }
+        };
+        let stream = match format {
+            cpal::SampleFormat::F32 => device.build_output_stream::<f32, _, _>(
+                config.clone(),
+                move |data: &mut [f32], _| {
+                    let frames = data.len() / channels;
+                    fill(&mut |i, s| data[i] = s, frames);
+                },
+                err,
+                None,
+            ),
+            cpal::SampleFormat::I16 => device.build_output_stream::<i16, _, _>(
+                config.clone(),
+                move |data: &mut [i16], _| {
+                    let frames = data.len() / channels;
+                    fill(&mut |i, s| data[i] = (s.clamp(-1.0, 1.0) * 32767.0) as i16, frames);
+                },
+                err,
+                None,
+            ),
+            other => return Err(format!("unsupported output format {other:?}")),
+        }
+        .map_err(|e| e.to_string())?;
+        stream.play().map_err(|e| e.to_string())?;
+        let feeder = Feeder {
+            queue,
+            step: src_rate as f64 / rate as f64,
+            state: Arc::new(Mutex::new((0.0, 0.0))),
+        };
+        Ok(Player { _stream: stream, feeder })
+    }
+
+    fn feeder(&self) -> Feeder {
+        self.feeder.clone()
+    }
+
+    /// Block until everything queued has played.
+    fn finish(self) {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while !self.feeder.queue.lock().unwrap().is_empty() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        // Let the device drain its own buffer.
+        std::thread::sleep(Duration::from_millis(150));
+    }
+}

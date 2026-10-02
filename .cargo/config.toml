@@ -1,0 +1,13 @@
+# whisper.cpp: MSVC can't auto-detect CPU features ("native"), which left it
+# with no SIMD at all. Pin AVX2/FMA/F16C — available on any x86-64 CPU from
+# ~2013 onwards — so the shipped binary is fast everywhere.
+[env]
+GGML_NATIVE = "OFF"
+GGML_AVX = "ON"
+GGML_AVX2 = "ON"
+GGML_FMA = "ON"
+GGML_F16C = "ON"
+# The cmake crate otherwise passes Release flags without /O2 on MSVC,
+# leaving whisper.cpp unoptimised (~30× slower).
+CMAKE_C_FLAGS_RELEASE = "/O2 /Ob2 /DNDEBUG /MD"
+CMAKE_CXX_FLAGS_RELEASE = "/O2 /Ob2 /DNDEBUG /MD /EHsc"

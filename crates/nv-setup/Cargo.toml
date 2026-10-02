@@ -1,0 +1,20 @@
+[package]
+name = "nv-setup"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "NeedleVoiceSetup"
+path = "src/main.rs"
+
+[dependencies]
+nv-core = { path = "../nv-core" }
+eframe = { version = "0.36", default-features = false, features = ["default_fonts", "glow"] }
+tar = "0.4"
+windows = { version = "0.62", features = ["Win32_UI_Shell"] }
+zstd = "0.14"
+
+[build-dependencies]
+winresource = "0.1"
+tar = "0.4"
+zstd = { version = "0.14", features = ["zstdmt"] }

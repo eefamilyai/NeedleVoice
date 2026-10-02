@@ -1,0 +1,18 @@
+[workspace]
+resolver = "2"
+members = ["crates/nv-core", "crates/nv-agent", "crates/nv-config", "crates/nv-setup"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true
+panic = "abort"
+
+# needle/whisper math is unusably slow unoptimised, even in dev builds
+[profile.dev.package."*"]
+opt-level = 3

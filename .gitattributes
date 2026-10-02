@@ -1,0 +1,5 @@
+# Keep line endings consistent: LF in the repository, whatever the editor does.
+* text=auto eol=lf
+*.png binary
+*.ico binary
+*.crate binary

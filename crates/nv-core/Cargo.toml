@@ -1,0 +1,43 @@
+[package]
+name = "nv-core"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+needle-infer = { version = "0.3.1", features = ["parallel"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "1"
+strsim = "0.11"
+log = "0.4"
+ureq = "3"
+bzip2 = "0.6"
+tar = "0.4"
+png = "0.18"
+
+[dependencies.windows]
+version = "0.62"
+features = [
+    "Win32_Foundation",
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_Variant",
+    "Win32_System_Registry",
+    "Win32_System_Threading",
+    "Win32_System_ProcessStatus",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_UI_Shell",
+    "Win32_UI_Shell_Common",
+    "Win32_UI_Shell_PropertiesSystem",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_Storage_FileSystem",
+    "Win32_Media_Speech",
+    "Win32_Storage_EnhancedStorage",
+    "Win32_Security",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_Graphics_Gdi",
+    "Win32_Media_Audio",
+    "Win32_Media_Audio_Endpoints",
+    "Win32_System_Shutdown",
+    "Win32_System_SystemInformation",
+]

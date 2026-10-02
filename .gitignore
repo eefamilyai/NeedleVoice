@@ -1,0 +1,12 @@
+# Build output
+/target
+/target-*
+**/*.rs.bk
+
+# Downloaded models (scripts/fetch-models.ps1) and the built installer
+/models
+/dist
+
+# Scratch and logs
+*.log
+/scratch
