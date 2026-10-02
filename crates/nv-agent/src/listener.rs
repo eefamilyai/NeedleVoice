@@ -24,7 +24,7 @@ use crate::stt::Stt;
 
 const FRAME: usize = 480; // 30 ms at 16 kHz
 const FRAME_MS: u32 = 30;
-const PREROLL_FRAMES: usize = 12; // keep ~360 ms before speech starts
+const PREROLL_FRAMES: usize = 20; // keep ~600 ms before speech starts
 const WAKE_END_SILENCE_MS: u32 = 450;
 const EARLY_CHECK_SECS: f32 = 2.2;
 const MAX_IDLE_SEGMENT_SECS: f32 = 8.0;
@@ -35,9 +35,10 @@ const MIN_SPEECH_FRAMES: u32 = 7; // ~200 ms of actual speech
 const KWS_RESET_AFTER_MS: u32 = 1200;
 /// How long the microphone is ignored after waking, so the chime (180 ms) and
 /// the last syllable of the name can't be mistaken for the start of a command.
-/// Kept under the preroll window below, which means anything spoken during it
+/// Long enough to swallow the 180 ms wake chime, so its sound cannot start a
+/// segment. Kept under the preroll window below, which means anything spoken during it
 /// is still prepended to the command when speech is finally detected.
-const WAKE_SETTLE_MS: u64 = 240;
+const WAKE_SETTLE_MS: u64 = 400;
 /// The settle window must fit inside the preroll, or the first words of the
 /// command after the name would be lost. Checked at compile time.
 const _: () = assert!(WAKE_SETTLE_MS <= PREROLL_FRAMES as u64 * FRAME_MS as u64);
@@ -241,7 +242,11 @@ pub fn run(cfg: Config, shared: Arc<Shared>, apps: Arc<RwLock<AppIndex>>, tts: A
                     k.reset();
                     spotter_quiet_ms = 0;
                     seg = None;
-                    preroll.clear();
+                    // The preroll is deliberately kept. The spotter reports the
+                    // phrase a frame or two after it ends, and people start the
+                    // command straight away, so the words in this window belong
+                    // to the command. Whisper transcribes "hey <name>" along with
+                    // it and the name is stripped from the transcript.
                     continue;
                 }
                 spotter_quiet_ms = if speech { 0 } else { spotter_quiet_ms + FRAME_MS };

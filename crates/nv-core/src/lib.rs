@@ -26,6 +26,6 @@ pub const AGENT_EXE: &str = "NeedleVoice.exe";
 pub const CONFIG_EXE: &str = "NeedleVoiceConfig.exe";
 pub const UNINSTALL_EXE: &str = "Uninstall.exe";
 pub const NEEDLE_MODEL: &str = "needle3.cact";
-pub const DEFAULT_WHISPER_MODEL: &str = "ggml-tiny.en-q5_1.bin";
+pub const DEFAULT_WHISPER_MODEL: &str = "ggml-medium.en-q5_0.bin";
 /// Named mutex the agent holds while running, so only one copy listens.
 pub const AGENT_MUTEX: &str = "Local\\NeedleVoiceAgentSingleton";

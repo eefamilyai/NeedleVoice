@@ -15,18 +15,28 @@ pub struct Stt {
 
 impl Stt {
     pub fn new(path: PathBuf, threads: u32, agent_name: &str) -> Self {
-        // Priming Whisper with the name and some vocabulary makes it spell them
-        // consistently. The prompt deliberately never contains "hey <name>":
-        // on silence Whisper may echo its prompt, which must not wake us.
-        let prompt = format!("{agent_name}. Open Chrome. Search for the weather. Close Spotify.");
+        // Priming Whisper with the name and the words this app actually acts on
+        // makes it spell them consistently — "disengage" used to come back as
+        // "this engage". The prompt deliberately never contains "hey <name>": on
+        // silence Whisper may echo its prompt, and that must not wake us.
+        let prompt = format!(
+            "{agent_name}. Commands: open Chrome, close Spotify, play music, pause, next track, \
+             volume up, take a screenshot, set an alarm, remind me, never mind, disengage, \
+             cancel that, what time is it, search the web."
+        );
         Self { path, threads: threads as i32, prompt, loaded: None, last_used: Instant::now() }
     }
 
     fn ensure(&mut self) -> Result<&mut WhisperState, String> {
         if self.loaded.is_none() {
             let t = Instant::now();
+            // `--features cuda` (or vulkan) builds the GPU backend in; without
+            // it this is a CPU build and asking for the GPU would just fail.
             let mut params = WhisperContextParameters::default();
-            params.use_gpu(false);
+            params.use_gpu(cfg!(feature = "gpu"));
+            // Measured on a Ryzen 5 2600: flash attention is 1.5× *slower* on
+            // this CPU (0.97 s vs 0.65 s per clip with base.en), so it stays off.
+            params.flash_attn(false);
             let ctx = WhisperContext::new_with_params(&self.path, params)
                 .map_err(|e| format!("could not load Whisper model {}: {e}", self.path.display()))?;
             let state = ctx.create_state().map_err(|e| e.to_string())?;

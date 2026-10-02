@@ -60,6 +60,19 @@ pub struct Alias {
     pub target: String,
 }
 
+/// Whisper and Needle want one thread per physical core: hyperthreads add
+/// little and slow the model down. The count is a guess from the logical count
+/// when the machine reports an even number above four, which is the common
+/// SMT case.
+pub fn recommended_threads() -> u32 {
+    let logical = std::thread::available_parallelism().map(|n| n.get() as u32).unwrap_or(4);
+    if logical > 4 && logical % 2 == 0 {
+        logical / 2
+    } else {
+        logical
+    }
+}
+
 /// How the settings app is coloured.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -226,7 +239,7 @@ impl Default for Config {
             end_silence_ms: 800,
             command_timeout_secs: 5.0,
             whisper_model: crate::DEFAULT_WHISPER_MODEL.into(),
-            threads: 4,
+            threads: recommended_threads(),
             needle_depth: 20,
             instant_commands: true,
             search_when_app_missing: true,

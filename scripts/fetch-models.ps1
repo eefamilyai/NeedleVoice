@@ -6,7 +6,7 @@ New-Item -ItemType Directory -Force -Path (Join-Path $models "voices") | Out-Nul
 
 $files = @{
     "needle3.cact"          = "https://huggingface.co/Cactus-Compute/needle3/resolve/main/needle3.cact"
-    "ggml-tiny.en-q5_1.bin" = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-tiny.en-q5_1.bin"
+    "ggml-medium.en-q5_0.bin" = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-medium.en-q5_0.bin"
 }
 foreach ($f in $files.Keys) {
     $dest = Join-Path $models $f

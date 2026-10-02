@@ -68,6 +68,45 @@ fn main() {
         return;
     }
 
+    // `--bench-stt <model-file> <clip.wav>…`: transcribe clips with a given
+    // Whisper model and report how long each took. This is the same code path
+    // the assistant uses, so the numbers mean something.
+    if args.iter().any(|a| a == "--bench-stt") {
+        let rest: Vec<&String> = args.iter().skip_while(|a| *a != "--bench-stt").skip(1).collect();
+        let Some((model, clips)) = rest.split_first() else {
+            eprintln!("usage: --bench-stt <model-file> <clip.wav>…");
+            return;
+        };
+        let cfg = nv_core::config::Config::load();
+        let path = nv_core::paths::models_dir().join(model.as_str());
+        let mut stt = stt::Stt::new(path, cfg.threads, &cfg.agent_name);
+        let mut total = 0f64;
+        for clip in clips {
+            let Ok(bytes) = std::fs::read(clip) else {
+                eprintln!("cannot read {clip}");
+                continue;
+            };
+            let audio: Vec<f32> = bytes[44..]
+                .chunks_exact(2)
+                .map(|b| i16::from_le_bytes([b[0], b[1]]) as f32 / 32768.0)
+                .collect();
+            let secs = audio.len() as f32 / 16000.0;
+            // One warm-up run, then three timed ones.
+            let _ = stt.transcribe(&audio);
+            let mut best = f64::MAX;
+            let mut text = String::new();
+            for _ in 0..3 {
+                let t = std::time::Instant::now();
+                text = stt.transcribe(&audio).unwrap_or_default();
+                best = best.min(t.elapsed().as_secs_f64());
+            }
+            total += best;
+            println!("{best:5.2}s  ({secs:.1}s audio, {:.1}x realtime)  {text}", secs as f64 / best);
+        }
+        println!("total {total:.2}s across {} clips", clips.len());
+        return;
+    }
+
     // `--chime`: play the wake-up chime once and exit. The settings app uses
     // this so you can hear exactly what waking sounds like.
     if args.iter().any(|a| a == "--chime") {

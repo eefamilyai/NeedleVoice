@@ -67,10 +67,15 @@ const SEARCH_ENGINES: [(&str, &str); 4] = [
     ("Brave Search", "https://search.brave.com/search?q={}"),
 ];
 
-const WHISPER_MODELS: [(&str, &str, u32); 3] = [
-    ("ggml-tiny.en-q5_1.bin", "Tiny — fastest (default)", 31),
-    ("ggml-base.en-q5_1.bin", "Base — more accurate, ~2× slower", 57),
-    ("ggml-small.en-q5_1.bin", "Small — most accurate, ~6× slower", 181),
+/// Whisper models offered in Settings: file, label, download size in MB.
+/// The times are measured on the machine this was built on (Ryzen 5 2600,
+/// 4 threads, a 3-second command), which is what makes them worth showing.
+const WHISPER_MODELS: [(&str, &str, u32); 5] = [
+    ("ggml-tiny.en-q5_1.bin", "Tiny — instant, but mishears words", 31),
+    ("ggml-base.en-q5_1.bin", "Base — quick, fine for clear speech", 57),
+    ("ggml-small.en-q5_1.bin", "Small — the best balance of the small ones", 181),
+    ("ggml-medium.en-q5_0.bin", "Medium — most accurate that still runs on a CPU (default)", 514),
+    ("ggml-large-v3-turbo-q5_0.bin", "Turbo — bigger, and no faster than Medium here", 547),
 ];
 
 struct App {
@@ -672,9 +677,18 @@ impl App {
                 ui::switch(ui, &mut self.cfg.search_when_app_missing, "");
             });
             let max = std::thread::available_parallelism().map(|n| n.get() as u32).unwrap_or(8);
-            ui::row(ui, "CPU threads", "Whisper and Needle share these", |ui| {
-                ui.add(egui::Slider::new(&mut self.cfg.threads, 1..=max));
-            });
+            let want = nv_core::config::recommended_threads();
+            ui::row(
+                ui,
+                "CPU threads",
+                &format!("This PC has {max} logical threads, about {want} real cores"),
+                |ui| {
+                    ui.add(egui::Slider::new(&mut self.cfg.threads, 1..=max));
+                    if self.cfg.threads != want && ui::ghost(ui, &format!("Use {want}")).clicked() {
+                        self.cfg.threads = want;
+                    }
+                },
+            );
             ui::row(ui, "Free memory after", "Models are loaded only while needed", |ui| {
                 ui.add(egui::Slider::new(&mut self.cfg.unload_after_secs, 10..=600).suffix(" s"));
             });

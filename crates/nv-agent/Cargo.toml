@@ -37,3 +37,12 @@ features = [
 
 [build-dependencies]
 winresource = "0.1"
+
+[features]
+# Speech recognition on the graphics card: several times faster than the CPU,
+# which is what makes the accurate models usable. `cuda` needs the CUDA toolkit
+# installed, `vulkan` needs the Vulkan SDK; both also need a driver that
+# supports them.
+gpu = []
+cuda = ["whisper-rs/cuda", "gpu"]
+vulkan = ["whisper-rs/vulkan", "gpu"]

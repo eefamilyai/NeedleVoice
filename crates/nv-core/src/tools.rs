@@ -598,10 +598,26 @@ pub fn match_phrases(cfg: &Config, text: &str, keep: &dyn Fn(&str) -> bool) -> O
         if !keep(tool) {
             return;
         }
-        let Some(caps) = match_phrase(pattern, text) else { return };
-        let specificity = pattern.split_whitespace().filter(|w| !w.starts_with('{')).count();
+        // Word for word first; a whole phrase with no blanks is also compared by
+        // how alike it sounds, because speech recognition mangles words
+        // ("disengage" came back as "this engage"). Long phrases only: "stop" and
+        // "step" are one edit apart and mean different things.
+        let (captures, exact) = match match_phrase(pattern, text) {
+            Some(caps) => (caps, true),
+            None if !pattern.contains('{') && crate::fuzzy::squash(pattern).chars().count() >= 8 => {
+                let spoken = crate::fuzzy::squash(text);
+                let want = crate::fuzzy::squash(pattern);
+                if crate::fuzzy::distance(&spoken, &want) > 2 || crate::fuzzy::similarity(&spoken, &want) < 0.78 {
+                    return;
+                }
+                (Vec::new(), false)
+            }
+            None => return,
+        };
+        // Exact wording always outranks a fuzzy hit.
+        let specificity = if exact { pattern.split_whitespace().filter(|w| !w.starts_with('{')).count() } else { 0 };
         if best.as_ref().is_none_or(|b| specificity > b.specificity) {
-            best = Some(PhraseHit { tool: tool.to_string(), captures: caps, specificity });
+            best = Some(PhraseHit { tool: tool.to_string(), captures, specificity });
         }
     };
     // User phrases first: on a tie theirs is the one they meant.
@@ -639,6 +655,23 @@ mod tests {
         );
         assert_eq!(match_phrase("shut down the computer", "shut down the computer"), Some(vec![]));
         assert_eq!(match_phrase("shut down the computer", "shut down the computer now"), None);
+    }
+
+    #[test]
+    fn a_misheard_phrase_still_lands() {
+        let cfg = Config::default();
+        // Whisper heard the user say this and the assistant searched the web.
+        let hit = match_any_phrase(&cfg, "This engage.").expect("should still be a disengage");
+        assert_eq!(hit.tool, "disengage");
+        // And the exact wording keeps working.
+        assert_eq!(match_any_phrase(&cfg, "never mind").unwrap().tool, "disengage");
+        assert_eq!(match_any_phrase(&cfg, "Turn off.").unwrap().tool, "disengage");
+        // Short words are never guessed at: "step" must not become "stop".
+        assert!(match_any_phrase(&cfg, "step").is_none());
+        assert!(match_any_phrase(&cfg, "cancer").is_none());
+        // Fuzzy never outranks what was actually said.
+        let pause = match_any_phrase(&cfg, "stop the music").unwrap();
+        assert_eq!(pause.tool, "media_pause");
     }
 
     #[test]

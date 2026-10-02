@@ -21,6 +21,33 @@ pin it either way:
 | --- | --- |
 | ![Alarms and reminders](docs/screenshots/settings-schedule.png) | ![Light](docs/screenshots/settings-light.png) |
 
+### Speech recognition: what each model costs
+
+Measured on this machine (Ryzen 5 2600, 4 threads, a 3-second command) with
+`NeedleVoice.exe --bench-stt <model> <clip.wav>`, which is the same code path the
+assistant uses:
+
+| Model | Size | Per command | Notes |
+|---|---|---|---|
+| `tiny.en-q5_1` | 31 MB | 0.44 s | Mishears words, and can loop on a repeat |
+| `base.en-q5_1` | 57 MB | 0.65 s | Fine for clear speech |
+| `small.en-q5_1` | 181 MB | 2.3 s | The best of the small ones |
+| `medium.en-q5_0` | 514 MB | 6.0 s | **Default.** The most accurate that still runs on a CPU |
+| `large-v3-turbo-q5_0` | 547 MB | 9.3 s | Larger, and *slower* than medium here: only its decoder is pruned, the encoder is full-size |
+
+There is no small model that matches medium — that is the accuracy/size tradeoff,
+not a tuning problem. What does change the picture is the graphics card:
+
+```
+cargo build --release -p nv-agent --features cuda     # needs the CUDA toolkit
+cargo build --release -p nv-agent --features vulkan    # needs the Vulkan SDK
+```
+
+Either one runs medium several times faster than this CPU does, which is the only
+way to have both accuracy and instant answers. Without it, the useful knobs are
+`threads` (one per physical core — a Ryzen 5 2600 should use 6, not 4) and a
+smaller model.
+
 ## What's inside
 
 | Executable | What it does |

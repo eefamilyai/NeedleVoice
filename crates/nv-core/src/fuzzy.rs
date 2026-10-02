@@ -152,3 +152,37 @@ mod tests {
         assert_eq!(url_encode("what is c++"), "what+is+c%2B%2B");
     }
 }
+
+/// Levenshtein distance between two strings, capped for cheapness.
+pub fn distance(a: &str, b: &str) -> usize {
+    let (a, b): (Vec<char>, Vec<char>) = (a.chars().collect(), b.chars().collect());
+    if a.is_empty() {
+        return b.len();
+    }
+    if b.is_empty() {
+        return a.len();
+    }
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    let mut cur = vec![0usize; b.len() + 1];
+    for (i, ca) in a.iter().enumerate() {
+        cur[0] = i + 1;
+        for (j, cb) in b.iter().enumerate() {
+            let cost = usize::from(ca != cb);
+            cur[j + 1] = (prev[j + 1] + 1).min(cur[j] + 1).min(prev[j] + cost);
+        }
+        std::mem::swap(&mut prev, &mut cur);
+    }
+    prev[b.len()]
+}
+
+/// How alike two spoken strings are, 0.0 (nothing in common) to 1.0 (identical)
+/// once spaces and punctuation are ignored. This is what lets a mis-heard
+/// "this engage" still be understood as "disengage".
+pub fn similarity(a: &str, b: &str) -> f64 {
+    let (x, y) = (squash(a), squash(b));
+    let longest = x.chars().count().max(y.chars().count());
+    if longest == 0 {
+        return 1.0;
+    }
+    1.0 - distance(&x, &y) as f64 / longest as f64
+}
