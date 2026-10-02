@@ -115,6 +115,11 @@ struct App {
     bpe: Option<nv_core::bpe::Bpe>,
     /// The "add to the schedule" form.
     new_item: NewItem,
+    /// Editing buffers for fields whose stored value is a list or a parsed
+    /// date. Those can't be edited in place: the frame after each keystroke
+    /// would rebuild the text from the parsed value, so a freshly typed newline
+    /// or a trailing comma would vanish under the caret.
+    drafts: std::collections::HashMap<String, String>,
 }
 
 impl App {
@@ -171,6 +176,7 @@ impl App {
             mic_check: None,
             bpe: nv_core::bpe::Bpe::load(&nv_core::wake_model::dir().join("bpe.model")),
             new_item: NewItem::default(),
+            drafts: Default::default(),
         }
     }
 
@@ -479,6 +485,20 @@ impl eframe::App for App {
     }
 }
 
+/// The "say any of these" box.
+///
+/// `draft` is what the user is typing and is never written from `stored`; the
+/// stored list is only ever derived from it. The other way round — rebuilding
+/// the text from the parsed list every frame — is what made Enter look broken:
+/// the newline was normalised away before the next frame could draw it.
+fn phrases_field(ui: &mut egui::Ui, draft: &mut String, stored: &mut Vec<String>) -> egui::Response {
+    let response = ui.add(egui::TextEdit::multiline(draft).desired_rows(3).desired_width(400.0));
+    if response.changed() {
+        *stored = draft.lines().map(|l| l.trim().to_lowercase()).filter(|l| !l.is_empty()).collect();
+    }
+    response
+}
+
 /// A tiny neon orb for the header and colour swatches.
 fn orb(ui: &egui::Ui, rect: egui::Rect, c: Color32) {
     let p = ui.painter();
@@ -491,6 +511,22 @@ fn orb(ui: &egui::Ui, rect: egui::Rect, c: Color32) {
 }
 
 impl App {
+    /// The editing buffer for a field: what has been typed so far, or the
+    /// stored value the first time round.
+    fn buffer(&self, key: &str, stored: &str) -> String {
+        self.drafts.get(key).cloned().unwrap_or_else(|| stored.to_string())
+    }
+
+    /// Remember a buffer for the next frame.
+    fn keep(&mut self, key: &str, text: String) {
+        self.drafts.insert(key.to_string(), text);
+    }
+
+    /// Throw away the buffers belonging to a function that no longer exists.
+    fn forget_buffers(&mut self, name: &str) {
+        self.drafts.retain(|k, _| !k.ends_with(name));
+    }
+
     fn tab_general(&mut self, ui: &mut egui::Ui, accent: Color32) {
         heading(ui, "General", accent);
         section(ui, "Wake word", |ui| {
@@ -499,7 +535,7 @@ impl App {
                 ui.add(egui::TextEdit::singleline(&mut self.cfg.agent_name).desired_width(160.0));
             });
             hint(ui, "Pick something distinctive with 2+ syllables (e.g. Nova, Jarvis, Echo) — it's harder to trigger by accident.");
-            let mut prefixes = self.cfg.wake_prefixes.join(", ");
+            let mut prefixes = self.buffer("wake:prefixes", &self.cfg.wake_prefixes.join(", "));
             ui.horizontal(|ui| {
                 ui.label("Words before the name");
                 if ui.add(egui::TextEdit::singleline(&mut prefixes).desired_width(220.0)).changed() {
@@ -507,10 +543,11 @@ impl App {
                         prefixes.split(',').map(|s| s.trim().to_lowercase()).filter(|s| !s.is_empty()).collect();
                 }
             });
+            self.keep("wake:prefixes", prefixes);
             ui.checkbox(&mut self.cfg.allow_name_only, "Also wake on just the name (no \"hey\")");
             ui.horizontal(|ui| {
                 ui.label("Also answer to");
-                let mut extra = self.cfg.wake_extra_names.join(", ");
+                let mut extra = self.buffer("wake:extra", &self.cfg.wake_extra_names.join(", "));
                 if ui
                     .add(egui::TextEdit::singleline(&mut extra).hint_text("no va, hey novah").desired_width(250.0))
                     .changed()
@@ -518,6 +555,7 @@ impl App {
                     self.cfg.wake_extra_names =
                         extra.split(',').map(|s| s.trim().to_lowercase()).filter(|s| !s.is_empty()).collect();
                 }
+                self.keep("wake:extra", extra);
             });
             hint(ui, "Comma-separated extra spellings. If it keeps mis-hearing your accent, add what it hears here — no retraining needed.");
             ui.add(egui::Slider::new(&mut self.cfg.wake_sensitivity, 0.0..=1.0).text("Sensitivity"));
@@ -940,7 +978,9 @@ impl App {
                     ui.add_sized([70.0, 18.0], egui::Label::new(RichText::new(item.kind.label()).color(accent).strong()));
 
                     if item.kind.timed() {
-                        let mut when = item.at.map(|at| at.date() + " " + &at.clock()).unwrap_or_default();
+                        let stored = item.at.map(|at| at.date() + " " + &at.clock()).unwrap_or_default();
+                        let key = format!("when:{id}");
+                        let mut when = self.buffer(&key, &stored);
                         let resp = ui.add(egui::TextEdit::singleline(&mut when).desired_width(115.0));
                         if resp.changed() {
                             let text = when.clone();
@@ -954,6 +994,13 @@ impl App {
                                 }
                                 dirty = true;
                             }
+                        }
+                        // Once it parses, the field snaps back to the canonical
+                        // form; until then the half-typed text stays put.
+                        if when != stored && (Stamp::parse_iso(&when).is_some() || nv_core::schedule_parse::parse(&when, now).is_ok()) {
+                            self.drafts.remove(&key);
+                        } else {
+                            self.keep(&key, when);
                         }
                         let label = match item.next_after(now) {
                             Some(at) => describe_when(at, item.repeat, now),
@@ -1377,7 +1424,10 @@ impl App {
                 hint(ui, "Nothing here yet — add one from a template below.");
             }
             for i in 0..count {
-                let tool = &mut self.cfg.custom_tools[i];
+                // Edited as a local copy: fields whose stored form is a list
+                // (parameters, phrases) need an editing buffer of their own, and
+                // that means touching `self` while the function is borrowed.
+                let mut tool = self.cfg.custom_tools[i].clone();
                 let name = tool.name.clone();
                 let label =
                     if tool.enabled { pretty_name(&tool.label()) } else { format!("{} (off)", pretty_name(&tool.label())) };
@@ -1399,7 +1449,8 @@ impl App {
                         hint(ui, "Needle reads this to decide when to use it, so say it plainly.");
                         ui.horizontal(|ui| {
                             ui.label("parameters");
-                            let mut params = tool.params.join(", ");
+                            let key = format!("params:{name}");
+                            let mut params = self.buffer(&key, &tool.params.join(", "));
                             if ui.add(egui::TextEdit::singleline(&mut params).hint_text("query").desired_width(240.0)).changed() {
                                 tool.params = params
                                     .split(',')
@@ -1407,6 +1458,7 @@ impl App {
                                     .filter(|p| !p.is_empty())
                                     .collect();
                             }
+                            self.keep(&key, params);
                         });
                         hint(ui, "Comma-separated. Use them below as {name}.");
                         ui.horizontal(|ui| {
@@ -1515,25 +1567,19 @@ impl App {
                                 ),
                             );
                         }
-                        let mut phrases = tool.phrases.join("\n");
+                        let phrase_key = format!("phrases:{name}");
+                        let mut phrases = self.buffer(&phrase_key, &tool.phrases.join("\n"));
                         ui.label("say any of these");
-                        if ui
-                            .add(egui::TextEdit::multiline(&mut phrases).desired_rows(2).desired_width(400.0))
-                            .changed()
-                        {
-                            tool.phrases =
-                                phrases.lines().map(|l| l.trim().to_lowercase()).filter(|l| !l.is_empty()).collect();
-                        }
-                        hint(ui, "One per line. A missing parameter captures the rest of the sentence.");
-                        let mut reply = tool.reply.clone();
+                        phrases_field(ui, &mut phrases, &mut tool.phrases);
+                        self.keep(&phrase_key, phrases);
+                        hint(ui, "One per line — press Enter for the next one. A missing parameter captures the rest of the sentence.");
                         ui.horizontal(|ui| {
                             ui.label("reply");
-                            if ui
-                                .add(egui::TextEdit::singleline(&mut reply).hint_text("say this afterwards").desired_width(360.0))
-                                .changed()
-                            {
-                                tool.reply = reply;
-                            }
+                            ui.add(
+                                egui::TextEdit::singleline(&mut tool.reply)
+                                    .hint_text("say this afterwards")
+                                    .desired_width(360.0),
+                            );
                         });
                         hint(ui, "Leave empty for a normal \"done\" line.");
                         ui.horizontal(|ui| {
@@ -1545,10 +1591,13 @@ impl App {
                             }
                         });
                     });
+                // Keep whatever the editor did with this function.
+                self.cfg.custom_tools[i] = tool;
             }
         });
         if let Some(i) = delete {
             let removed = self.cfg.custom_tools.remove(i);
+            self.forget_buffers(&removed.name);
             self.toast(format!("Removed \"{}\" — save to apply", pretty_name(&removed.label())), true);
         }
         if let Some(i) = try_it {
@@ -1885,5 +1934,85 @@ impl App {
             }
             self.save();
         }
+    }
+}
+
+#[cfg(test)]
+mod typing_tests {
+    use super::*;
+
+    /// One frame of a UI, with the input events egui would have received.
+    fn frame(
+        ctx: &egui::Context,
+        events: Vec<egui::Event>,
+        ui_fn: impl FnOnce(&mut egui::Ui) -> egui::Response,
+    ) -> egui::Response {
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0))),
+            events,
+            ..Default::default()
+        };
+        let mut out = None;
+        let mut ui_fn = Some(ui_fn);
+        let mut frame = ctx.run_ui(input, |ui| {
+            if let Some(f) = ui_fn.take() {
+                out = Some(f(ui));
+            }
+        });
+        // There is no renderer here to consume the font atlas.
+        frame.textures_delta.clear();
+        out.expect("a frame")
+    }
+
+    fn click(at: egui::Pos2) -> Vec<egui::Event> {
+        let button = |pressed| egui::Event::PointerButton {
+            pos: at,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: Default::default(),
+        };
+        vec![egui::Event::PointerMoved(at), button(true), button(false)]
+    }
+
+    fn press_enter() -> egui::Event {
+        egui::Event::Key {
+            key: egui::Key::Enter,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Default::default(),
+        }
+    }
+
+    /// What the user reported: pressing Enter in "say any of these" added
+    /// nothing, because the box was redrawn from the parsed list every frame.
+    #[test]
+    fn enter_starts_a_new_line() {
+        let ctx = egui::Context::default();
+        // Let egui settle: it needs a frame before widgets have a size.
+        let mut stored: Vec<String> = Vec::new();
+        let mut draft = String::new();
+        let mut rect = egui::Rect::NOTHING;
+        for _ in 0..2 {
+            rect = frame(&ctx, Vec::new(), |ui| phrases_field(ui, &mut draft, &mut stored)).rect;
+        }
+
+        // Click into the box, then type a line, press Enter, type another.
+        frame(&ctx, click(rect.center()), |ui| phrases_field(ui, &mut draft, &mut stored));
+        frame(&ctx, vec![egui::Event::Text("say something funny".into())], |ui| {
+            phrases_field(ui, &mut draft, &mut stored)
+        });
+        frame(&ctx, vec![press_enter()], |ui| phrases_field(ui, &mut draft, &mut stored));
+        frame(&ctx, vec![egui::Event::Text("tell me a joke".into())], |ui| {
+            phrases_field(ui, &mut draft, &mut stored)
+        });
+
+        assert!(draft.contains('\n'), "the newline must survive into the next frame: {draft:?}");
+        assert_eq!(stored, vec!["say something funny".to_string(), "tell me a joke".to_string()]);
+
+        // A blank line is ignored in the list but kept in the box.
+        frame(&ctx, vec![press_enter()], |ui| phrases_field(ui, &mut draft, &mut stored));
+        assert_eq!(stored.len(), 2);
+        assert!(draft.ends_with('\n'), "{draft:?}");
     }
 }
