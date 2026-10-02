@@ -19,7 +19,7 @@ fn pipeline_on_wavs() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let cfg = Config::default();
     let models = root.join("models");
-    let mut stt = crate::stt::Stt::new(models.join(&cfg.whisper_model), cfg.threads, &cfg.agent_name);
+    let mut stt = crate::stt::Stt::new(&cfg);
     let mut brain = Brain::new(models.join(nv_core::NEEDLE_MODEL), cfg.needle_depth);
     let apps = AppIndex::load_cache().unwrap_or_default();
     let mut entries: Vec<_> = std::fs::read_dir(root.join("target/wav")).unwrap().flatten().collect();
@@ -195,7 +195,7 @@ fn live_wake() {
     println!("{} s audio, max frame {max_db:.1} dB; frames loud={loud} vad={voiced} both={both}", audio.len() / 16000);
     println!("{line}");
     let cfg = Config::default();
-    let mut stt = crate::stt::Stt::new(root.join("models").join(&cfg.whisper_model), 4, "Nova");
+    let mut stt = crate::stt::Stt::whisper(root.join("models").join(&cfg.whisper_model), 4, "Nova");
     let text = stt.transcribe(&audio).unwrap();
     println!("whisper: {text:?}\nwake: {:?}", wake::detect(&text, &cfg));
 }
@@ -257,7 +257,7 @@ fn realtek_timeline() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let maxabs = mono.iter().fold(0f32, |m, x| m.max(x.abs())).max(1e-6);
     let norm: Vec<f32> = mono.iter().map(|x| x / maxabs * 0.7).collect();
-    let mut stt = crate::stt::Stt::new(root.join("models/ggml-tiny.en-q5_1.bin"), 4, "Nova");
+    let mut stt = crate::stt::Stt::whisper(root.join("models/ggml-tiny.en-q5_1.bin"), 4, "Nova");
     println!("raw whisper: {:?}", stt.transcribe(&mono).unwrap());
     println!("normalized whisper: {:?} (gain {:.0} dB)", stt.transcribe(&norm).unwrap(), 20.0 * (0.7 / maxabs).log10());
 }

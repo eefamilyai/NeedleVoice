@@ -74,7 +74,7 @@ impl Segment {
 
 pub fn run(cfg: Config, shared: Arc<Shared>, apps: Arc<RwLock<AppIndex>>, tts: Arc<Tts>, ctl: Receiver<Ctl>) {
     let models = nv_core::paths::models_dir();
-    let mut stt = Stt::new(models.join(&cfg.whisper_model), cfg.threads, &cfg.agent_name);
+    let mut stt = Stt::new(&cfg);
     let mut brain = Brain::new(models.join(nv_core::NEEDLE_MODEL), cfg.needle_depth);
     if !brain.model_exists() {
         log::error!("Needle model missing at {}", models.display());

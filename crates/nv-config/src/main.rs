@@ -14,7 +14,7 @@ use eframe::egui::{self, Color32, RichText, Stroke};
 use jobs::Job;
 use nv_core::apps::AppIndex;
 use nv_core::brain::Brain;
-use nv_core::config::{parse_hex, Alias, Appearance, Browser, ACCENT_PRESETS};
+use nv_core::config::{parse_hex, Alias, Appearance, Browser, SttEngine, ACCENT_PRESETS};
 use nv_core::schedule::{describe_when, Item, ItemKind, Repeat, Schedule, Stamp};
 use nv_core::tools::{self, CustomKind, CustomTool, Step, StepKind};
 use nv_core::personality::{self, Moment, Persona};
@@ -620,7 +620,38 @@ impl App {
 
         let models = nv_core::paths::models_dir();
         let mut download: Option<(&'static str, u32)> = None;
-        ui::card_rows(ui, "Speech recognition", "Whisper turns the command into text", |ui| {
+        let mut get_moonshine = false;
+        ui::card_rows(ui, "Speech recognition", "Turns what you said into text", |ui| {
+            ui::row(ui, "Engine", "Moonshine is built for short commands and is ~30× faster here", |ui| {
+                let mut engine = self.cfg.stt_engine;
+                if ui::segmented(ui, &mut engine, &SttEngine::ALL.map(|e| (e, e.label()))) {
+                    self.cfg.stt_engine = engine;
+                }
+            });
+            if self.cfg.stt_engine == SttEngine::Moonshine {
+                // English-only, and either on disk or one download away.
+                ui::row(ui, "Moonshine", "English only", |ui| {
+                    if nv_core::moonshine_installed() {
+                        ui::pill(ui, "installed", ui::theme(ui).ok);
+                    } else if self.job_running("moonshine").is_some() {
+                        let progress = self
+                            .job_running("moonshine")
+                            .and_then(|j| j.0.lock().ok().map(|s| s.progress))
+                            .unwrap_or(-1.0);
+                        ui.add(egui::ProgressBar::new(progress.max(0.0)).desired_width(200.0).fill(ui::theme(ui).accent));
+                    } else {
+                        ui::pill(ui, "not downloaded", ui::theme(ui).warn);
+                        if ui::ghost(ui, "Download (270 MB)").clicked() {
+                            get_moonshine = true;
+                        }
+                    }
+                });
+                ui.horizontal(|ui| {
+                    ui.add_space(14.0);
+                    ui::hint(ui, "Until it is downloaded the assistant keeps using Whisper.");
+                });
+                ui.add_space(8.0);
+            } else {
             for (file, label, mb) in WHISPER_MODELS {
                 let have = models.join(file).exists();
                 ui::row(ui, label, if have { "" } else { "not downloaded yet" }, |ui| {
@@ -645,7 +676,31 @@ impl App {
                     }
                 });
             }
+            }
         });
+        if get_moonshine {
+            self.start_job(ctx, "moonshine", "Downloading Moonshine", move |p| {
+                let dir = nv_core::moonshine_dir();
+                std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+                let files = [
+                    "preprocess.onnx",
+                    "encode.int8.onnx",
+                    "uncached_decode.int8.onnx",
+                    "cached_decode.int8.onnx",
+                    "tokens.txt",
+                ];
+                for (i, name) in files.iter().enumerate() {
+                    let url = format!(
+                        "https://huggingface.co/csukuangfj/sherpa-onnx-moonshine-base-en-int8/resolve/main/{name}"
+                    );
+                    let done = i as f32;
+                    jobs::download_file(&url, &dir.join(name), &mut |fraction| {
+                        p((done + fraction.max(0.0)) / files.len() as f32)
+                    })?;
+                }
+                Ok("Moonshine installed — commands are transcribed in about a fifth of a second".to_string())
+            });
+        }
         if let Some((file, _)) = download {
             let dest = models.join(file);
             self.start_job(ctx, file, &format!("Downloading {file}"), move |p| {

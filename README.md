@@ -21,7 +21,20 @@ pin it either way:
 | --- | --- |
 | ![Alarms and reminders](docs/screenshots/settings-schedule.png) | ![Light](docs/screenshots/settings-light.png) |
 
-### Speech recognition: what each model costs
+### Speech recognition: Moonshine, or Whisper
+
+Two engines, chosen in Settings:
+
+| Engine | Per command | Notes |
+|---|---|---|
+| **Moonshine** (default) | **0.20 s** | English only. Built for short utterances, so it is 30× faster than Whisper here and, on the test clips, more accurate than every Whisper model below |
+| Whisper `medium.en` | 6.0 s | Multilingual models available; the accurate fallback |
+
+Moonshine comes from `sherpa-onnx`, the same library the voices already use, so
+there is nothing new to install. The models are 270 MB and Settings fetches them
+on demand; until they are there the assistant uses Whisper and says so in the log.
+
+### What each Whisper model costs
 
 Measured on this machine (Ryzen 5 2600, 4 threads, a 3-second command) with
 `NeedleVoice.exe --bench-stt <model> <clip.wav>`, which is the same code path the

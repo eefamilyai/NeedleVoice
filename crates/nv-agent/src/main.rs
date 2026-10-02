@@ -59,7 +59,7 @@ fn main() {
                     .map(|b| i16::from_le_bytes([b[0], b[1]]) as f32 / 32768.0)
                     .collect();
                 let models = nv_core::paths::models_dir();
-                let mut stt = stt::Stt::new(models.join(&cfg.whisper_model), cfg.threads, &cfg.agent_name);
+                let mut stt = stt::Stt::new(&cfg);
                 stt.transcribe(&audio).unwrap_or_else(|e| format!("ERROR: {e}"))
             }
             Err(e) => format!("ERROR: {e}"),
@@ -78,8 +78,11 @@ fn main() {
             return;
         };
         let cfg = nv_core::config::Config::load();
-        let path = nv_core::paths::models_dir().join(model.as_str());
-        let mut stt = stt::Stt::new(path, cfg.threads, &cfg.agent_name);
+        let mut stt = if model.as_str() == "moonshine" {
+            stt::Stt::moonshine(cfg.threads)
+        } else {
+            stt::Stt::whisper(nv_core::paths::models_dir().join(model.as_str()), cfg.threads, &cfg.agent_name)
+        };
         let mut total = 0f64;
         for clip in clips {
             let Ok(bytes) = std::fs::read(clip) else {

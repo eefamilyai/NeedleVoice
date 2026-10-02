@@ -60,6 +60,28 @@ pub struct Alias {
     pub target: String,
 }
 
+/// Which speech recogniser transcribes a command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SttEngine {
+    /// sherpa-onnx Moonshine: built for short utterances, a fraction of a second
+    /// on a CPU.
+    Moonshine,
+    /// whisper.cpp, with the model chosen in Settings.
+    Whisper,
+}
+
+impl SttEngine {
+    pub const ALL: [SttEngine; 2] = [SttEngine::Moonshine, SttEngine::Whisper];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            SttEngine::Moonshine => "Moonshine",
+            SttEngine::Whisper => "Whisper",
+        }
+    }
+}
+
 /// Whisper and Needle want one thread per physical core: hyperthreads add
 /// little and slow the model down. The count is a guess from the logical count
 /// when the machine reports an even number above four, which is the common
@@ -148,6 +170,8 @@ pub struct Config {
     pub end_silence_ms: u32,
     /// How long to wait for a command after just "hey <name>", in seconds.
     pub command_timeout_secs: f32,
+    /// Which speech recogniser to use.
+    pub stt_engine: SttEngine,
     /// Whisper model file in the models folder.
     pub whisper_model: String,
     /// CPU threads used for speech recognition and Needle.
@@ -238,6 +262,7 @@ impl Default for Config {
             min_speech_db: -50.0,
             end_silence_ms: 800,
             command_timeout_secs: 5.0,
+            stt_engine: SttEngine::Moonshine,
             whisper_model: crate::DEFAULT_WHISPER_MODEL.into(),
             threads: recommended_threads(),
             needle_depth: 20,

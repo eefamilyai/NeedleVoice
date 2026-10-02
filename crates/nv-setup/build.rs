@@ -30,7 +30,9 @@ fn main() {
     .map(|f| (rel.join(f), f.to_string()))
     .chain([
         (models.join("needle3.cact"), "models/needle3.cact".into()),
-        (models.join("ggml-tiny.en-q5_1.bin"), "models/ggml-tiny.en-q5_1.bin".into()),
+        // One small Whisper, so switching engine in Settings works straight
+        // away; the bigger ones are a download.
+        (models.join("ggml-base.en-q5_1.bin"), "models/ggml-base.en-q5_1.bin".into()),
     ])
     .collect();
 
@@ -46,6 +48,21 @@ fn main() {
     let voice_dir = models.join("voices").join(voice);
     assert!(voice_dir.exists(), "missing default voice {}", voice_dir.display());
     println!("cargo:rerun-if-changed={}", voice_dir.display());
+
+    // Moonshine is the default recogniser now, so the tiny pack rides along:
+    // same speed as base, 118 MB instead of 273, and the settings app can
+    // upgrade to base in one click. Without it a fresh install would need a
+    // download before it could hear anything.
+    let moonshine_pack = "sherpa-onnx-moonshine-tiny-en-int8";
+    let moonshine_dir = models.join("moonshine").join(moonshine_pack);
+    let moonshine_file = |f: &str| moonshine_dir.join(f).exists();
+    assert!(
+        ["preprocess.onnx", "encode.int8.onnx", "uncached_decode.int8.onnx", "cached_decode.int8.onnx", "tokens.txt"]
+            .iter()
+            .all(|f| moonshine_file(f)),
+        "missing the Moonshine model — run scripts/fetch-models.ps1 -WithMoonshine"
+    );
+    println!("cargo:rerun-if-changed={}", moonshine_dir.display());
 
     // The wake-word keyword model (about 5 MB): without it the agent has to
     // fall back to Whisper for wake detection.
@@ -64,6 +81,7 @@ fn main() {
         }
         add_dir(&mut tar, &voice_dir, &format!("models/voices/{voice}"));
         add_dir(&mut tar, &kws_dir, &format!("models/kws/{kws}"));
+        add_dir(&mut tar, &moonshine_dir, &format!("models/moonshine/{moonshine_pack}"));
         tar.finish().unwrap();
     }
     enc.finish().unwrap();

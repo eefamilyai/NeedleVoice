@@ -4,12 +4,25 @@ $root = Split-Path $PSScriptRoot -Parent
 $models = Join-Path $root "models"
 New-Item -ItemType Directory -Force -Path (Join-Path $models "voices") | Out-Null
 
+param([switch]$WithMoonshine)
+
 $files = @{
     "needle3.cact"          = "https://huggingface.co/Cactus-Compute/needle3/resolve/main/needle3.cact"
     "ggml-medium.en-q5_0.bin" = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-medium.en-q5_0.bin"
 }
+if ($WithMoonshine) {
+    # Bundling this makes the installer ~275 MB bigger, so it is opt-in: the
+    # settings app downloads the same files on demand otherwise.
+    $moonshine = @("preprocess.onnx", "encode.int8.onnx", "uncached_decode.int8.onnx",
+                   "cached_decode.int8.onnx", "tokens.txt")
+    foreach ($m in $moonshine) {
+        $files["moonshine\sherpa-onnx-moonshine-base-en-int8\$m"] =
+            "https://huggingface.co/csukuangfj/sherpa-onnx-moonshine-base-en-int8/resolve/main/$m"
+    }
+}
 foreach ($f in $files.Keys) {
     $dest = Join-Path $models $f
+    New-Item -ItemType Directory -Force -Path (Split-Path $dest -Parent) | Out-Null
     if (-not (Test-Path $dest)) { Write-Host "Downloading $f"; curl.exe -L --fail -o $dest $files[$f] }
 }
 
