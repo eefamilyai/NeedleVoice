@@ -7,6 +7,20 @@ what you want, and the assistant does it and answers out loud.
 
 Everything runs locally: no cloud, no API keys.
 
+## What it looks like
+
+The settings window has its own title bar, grouped navigation and a page for
+everything the assistant does. It follows Windows' light/dark setting, or you can
+pin it either way:
+
+| General | Functions |
+| --- | --- |
+| ![General](docs/screenshots/settings-general.png) | ![Functions](docs/screenshots/settings-functions.png) |
+
+| Alarms & reminders | Light appearance |
+| --- | --- |
+| ![Alarms and reminders](docs/screenshots/settings-schedule.png) | ![Light](docs/screenshots/settings-light.png) |
+
 ## What's inside
 
 | Executable | What it does |
