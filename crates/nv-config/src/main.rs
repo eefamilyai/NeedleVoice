@@ -1716,6 +1716,30 @@ impl App {
 }
 
 fn main() -> eframe::Result {
+    let args: Vec<String> = std::env::args().collect();
+    // `--miccheck`: run the microphone check with no window and write the
+    // result to %APPDATA%\NeedleVoice\miccheck.txt. Useful on a machine whose
+    // audio needs diagnosing, and it exercises the whole wizard — opening the
+    // microphones, both steps and the analysis — without a UI to click.
+    if args.iter().any(|a| a == "--miccheck") {
+        let cfg = Config::load();
+        let ctx = egui::Context::default();
+        let started = std::time::Instant::now();
+        let body = match miccheck::run_to_completion(&cfg, &ctx, Duration::from_secs(45)) {
+            Ok(cal) => miccheck::describe(&cal),
+            Err(e) => format!("{e}\n"),
+        };
+        let text = format!(
+            "NeedleVoice microphone check — {} (took {:.1}s)\n\n{body}",
+            Stamp::now().date() + " " + &Stamp::now().clock(),
+            started.elapsed().as_secs_f32()
+        );
+        let path = nv_core::paths::data_dir().join("miccheck.txt");
+        let _ = std::fs::write(&path, &text);
+        log::info!("mic check written to {}", path.display());
+        return Ok(());
+    }
+
     let opts = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("NeedleVoice Settings")

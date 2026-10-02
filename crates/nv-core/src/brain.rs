@@ -207,7 +207,7 @@ impl Brain {
     pub fn decide(&mut self, command: &str, cfg: &Config, apps: &AppIndex) -> Decision {
         let t = Instant::now();
         self.last_used = Instant::now();
-        let command = clean_command(command);
+        let command = clean_command(command, cfg);
 
         if cfg.instant_commands {
             if let Some(actions) = instant(&command, cfg, apps) {
@@ -364,8 +364,33 @@ pub fn looks_like_domain(s: &str) -> bool {
             .any(|tld| s.ends_with(tld) || s.contains(&format!("{tld}/")))
 }
 
-/// Strip politeness and the trailing punctuation Whisper adds.
-fn clean_command(s: &str) -> String {
+/// Is this function switched on? The instant paths have to check, or a
+/// function the user turned off would keep answering.
+fn enabled(cfg: &Config, name: &str) -> bool {
+    !cfg.disabled_tools.iter().any(|d| d == name)
+}
+
+/// Words that add nothing at the end of a command: "what's the time *right now*".
+/// They matter because matching is exact — one stray "now" and a command that
+/// should be instant goes off to the model instead.
+const TRAILING_FILLER: &[&str] = &[
+    "right now",
+    "now",
+    "please",
+    "pls",
+    "thanks",
+    "thank you",
+    "for me",
+    "exactly",
+    "currently",
+    "at the moment",
+    "when you can",
+    "real quick",
+];
+
+/// Strip politeness, the trailing "right now", the assistant's own name, and
+/// the punctuation Whisper adds.
+fn clean_command(s: &str, cfg: &Config) -> String {
     let mut c = s.trim().trim_end_matches(['.', '!', '?', ',']).trim().to_string();
     let lower = c.to_lowercase();
     for p in ["can you please ", "could you please ", "can you ", "could you ", "would you ", "please ", "and ", "um ", "uh "] {
@@ -374,7 +399,72 @@ fn clean_command(s: &str) -> String {
             break;
         }
     }
-    c.trim_end_matches(" please").trim().to_string()
+    let names: Vec<String> = cfg.wake_names().iter().map(|n| fuzzy::normalize(n)).collect();
+    loop {
+        let before = c.clone();
+        let lower = c.to_lowercase();
+        for f in TRAILING_FILLER.iter().map(|f| f.to_string()).chain(names.iter().cloned()) {
+            if lower.len() > f.len() && lower.ends_with(&f) {
+                let cut = c.len() - f.len();
+                // Only when it starts on a word boundary.
+                if c[..cut].ends_with(' ') {
+                    c = c[..cut].trim_end_matches([',', ' ']).to_string();
+                }
+            }
+        }
+        if c == before {
+            break;
+        }
+    }
+    c.trim().to_string()
+}
+
+/// Words that carry no content in a question about the clock or the date.
+const CLOCK_QUESTION_WORDS: &[&str] = &[
+    "what", "whats", "is", "are", "it", "the", "time", "right", "now", "exactly", "exact", "currently",
+    "current", "clock", "oclock", "please", "pls", "tell", "me", "can", "could", "you", "do", "we", "have",
+    "got", "know", "my", "local", "and", "so", "then", "at", "moment", "again", "today", "tonight", "morning",
+    "afternoon", "evening",
+];
+const DATE_QUESTION_WORDS: &[&str] = &[
+    "what", "whats", "is", "are", "it", "the", "date", "day", "today", "todays", "tonight", "tomorrow",
+    "weekday", "month", "year", "right", "now", "exactly", "exact", "currently", "current", "please", "pls",
+    "tell", "me", "can", "could", "you", "do", "we", "have", "got", "know", "my", "local", "of", "and", "so",
+    "then", "at", "moment",
+];
+
+/// Is the whole sentence a question about one thing ("what is the exact time"),
+/// rather than a question that merely mentions it ("what time does the shop
+/// open")? Only the first kind can be answered from the clock.
+fn asks_only_about(text: &str, cfg: &Config, vocab: &[&str], anchors: &[&str]) -> bool {
+    let words: Vec<&str> = text.split(' ').filter(|w| !w.is_empty()).collect();
+    if words.is_empty() {
+        return false;
+    }
+    let names: Vec<String> = cfg.wake_names().iter().map(|n| fuzzy::normalize(n)).collect();
+    let mut anchored = false;
+    for w in &words {
+        if anchors.contains(w) {
+            anchored = true;
+        } else if vocab.contains(w) || names.iter().any(|n| n.split(' ').any(|part| part == *w)) {
+            continue;
+        } else {
+            return false;
+        }
+    }
+    anchored
+}
+
+const TIME_ANCHORS: &[&str] = &["time", "clock", "oclock"];
+const DATE_ANCHORS: &[&str] = &["date", "day", "today", "tonight"];
+
+/// A schedule question, as opposed to something being put *on* the schedule.
+fn asks_about_schedule(text: &str) -> bool {
+    const KEYWORDS: [&str; 7] = ["schedule", "calendar", "alarm", "reminder", "to do list", "todo list", "to do"];
+    const VERBS: [&str; 12] = [
+        "set", "add", "put", "remind", "cancel", "delete", "remove", "mark", "complete", "finish", "done", "make",
+    ];
+    KEYWORDS.iter().any(|k| text.contains(k)) && !VERBS.iter().any(|v| text.split(' ').any(|w| w == *v))
 }
 
 const OPEN_VERBS: &[&str] = &["open up", "bring up", "pull up", "fire up", "open", "launch", "start", "run", "load"];
@@ -422,14 +512,20 @@ fn instant(command: &str, cfg: &Config, apps: &AppIndex) -> Option<Vec<Action>> 
             return Some(vec![with_query_text(a, &text)]);
         }
     }
-    // Anything that mentions the schedule is a question about it, however
-    // Whisper spelled the first word ("words on my schedule"). Setting and
-    // cancelling were already claimed by the phrase list above.
-    if ["schedule", "calendar", "alarm", "reminder", "to do list", "todo list", "to do"]
-        .iter()
-        .any(|k| text.contains(k))
-    {
+    // A question about the schedule, however Whisper spelled the first word
+    // ("words on my schedule"). Anything with a setting verb in it was already
+    // claimed by the phrase list above, or is left to the model.
+    if enabled(cfg, "show_schedule") && asks_about_schedule(&text) {
         return Some(vec![Action::ShowSchedule { what: command.trim().to_string() }]);
+    }
+
+    // "what is the time right now", "what's the exact time", "what day is it
+    // today" — questions made of nothing but clock words.
+    if enabled(cfg, "tell_time") && asks_only_about(&text, cfg, CLOCK_QUESTION_WORDS, TIME_ANCHORS) {
+        return Some(vec![Action::TellTime]);
+    }
+    if enabled(cfg, "tell_date") && asks_only_about(&text, cfg, DATE_QUESTION_WORDS, DATE_ANCHORS) {
+        return Some(vec![Action::TellDate]);
     }
 
     // "play X on youtube" / "search youtube for X"
@@ -525,7 +621,7 @@ mod tests {
     fn instant_rules() {
         let cfg = Config::default();
         let apps = index();
-        let run = |c: &str| instant(&clean_command(c), &cfg, &apps);
+        let run = |c: &str| instant(&clean_command(c, &cfg), &cfg, &apps);
         assert_eq!(run("Open Chrome."), Some(vec![Action::OpenApp("Google Chrome".into())]));
         assert_eq!(run("open discord and spotify"), Some(vec![Action::OpenApp("Discord".into()), Action::OpenApp("Spotify".into())]));
         assert_eq!(run("open code"), Some(vec![Action::OpenApp("Visual Studio Code".into())]));
@@ -543,7 +639,7 @@ mod tests {
     fn instant_media_and_system() {
         let cfg = Config::default();
         let apps = index();
-        let run = |c: &str| instant(&clean_command(c), &cfg, &apps);
+        let run = |c: &str| instant(&clean_command(c, &cfg), &cfg, &apps);
         assert_eq!(run("pause the music"), Some(vec![Action::Media(MediaKey::Pause)]));
         assert_eq!(run("stop media"), Some(vec![Action::Media(MediaKey::Pause)]));
         assert_eq!(run("resume the music"), Some(vec![Action::Media(MediaKey::Resume)]));
@@ -569,7 +665,7 @@ mod tests {
         let mut cfg = Config::default();
         cfg.custom_tools = tools::sanitize_tools(tools::templates(), &[]);
         let apps = index();
-        let run = |c: &str| instant(&clean_command(c), &cfg, &apps);
+        let run = |c: &str| instant(&clean_command(c, &cfg), &cfg, &apps);
         assert_eq!(
             run("search spotify for daft punk"),
             Some(vec![Action::Custom {
@@ -631,7 +727,7 @@ mod tests {
     fn instant_schedule_commands() {
         let cfg = Config::default();
         let apps = index();
-        let run = |c: &str| instant(&clean_command(c), &cfg, &apps);
+        let run = |c: &str| instant(&clean_command(c, &cfg), &cfg, &apps);
         assert_eq!(
             run("set an alarm for 7:30 am"),
             Some(vec![Action::Alarm { when: "7 30 am".into(), label: String::new() }])
@@ -676,6 +772,67 @@ mod tests {
         // And through the model's own JSON.
         let calls = parse_calls(r#"[{"name":"set_alarm","arguments":{"when":"7:30 am","label":"wake up"}}]"#, &cfg);
         assert_eq!(calls, vec![Action::Alarm { when: "7:30 am".into(), label: "wake up".into() }]);
+    }
+
+    /// "what is the time right now" used to open Google, because the instant
+    /// phrases match exactly and one stray "right now" broke the match.
+    #[test]
+    fn clock_questions_are_answered() {
+        let mut cfg = Config::default();
+        cfg.agent_name = "Reggie".into();
+        let apps = index();
+        let run = |c: &str| instant(&clean_command(c, &cfg), &cfg, &apps);
+        for q in [
+            "what is the time right now",
+            "what's the time right now",
+            "what time is it right now",
+            "what is the time now",
+            "what is the exact time",
+            "what time do we have",
+            "what is the current time",
+            "tell me the time please",
+            "what's the time right now reggie",
+            "what is the time",
+        ] {
+            assert_eq!(run(q), Some(vec![Action::TellTime]), "{q:?}");
+        }
+        for q in ["what is the date right now", "what day is it today", "what's the date today", "what date is it"] {
+            assert_eq!(run(q), Some(vec![Action::TellDate]), "{q:?}");
+        }
+        // A question that only *mentions* the time is still a search.
+        for q in ["what time does the shop open", "what is the time in new york", "what is the earliest train"] {
+            assert_eq!(run(q), Some(vec![Action::WebSearch(q.to_string())]), "{q:?}");
+        }
+    }
+
+    #[test]
+    fn trailing_filler_is_ignored() {
+        let mut cfg = Config::default();
+        cfg.agent_name = "Reggie".into();
+        let apps = index();
+        let run = |c: &str| instant(&clean_command(c, &cfg), &cfg, &apps);
+        assert_eq!(run("open chrome right now"), Some(vec![Action::OpenApp("Google Chrome".into())]));
+        assert_eq!(run("close spotify please"), Some(vec![Action::CloseApp("Spotify".into())]));
+        assert_eq!(run("pause the music right now"), Some(vec![Action::Media(MediaKey::Pause)]));
+        assert_eq!(run("cancel my alarm now"), Some(vec![Action::CancelSchedule { what: String::new() }]));
+        assert_eq!(run("what's on my schedule now"), Some(vec![Action::ShowSchedule { what: "whats on my schedule".into() }]));
+        // A name tacked on the end is not part of the request either.
+        assert_eq!(run("open spotify reggie"), Some(vec![Action::OpenApp("Spotify".into())]));
+        // …but real content after the verb is not filler.
+        assert_eq!(run("open the thing i was using"), None);
+    }
+
+    #[test]
+    fn putting_things_on_the_schedule_is_not_reading_it() {
+        let cfg = Config::default();
+        let apps = index();
+        let run = |c: &str| instant(&clean_command(c, &cfg), &cfg, &apps);
+        // No phrase covers this, so it must reach the model rather than being
+        // mistaken for "what is on my schedule".
+        assert_eq!(run("set a reminder for 5"), None);
+        // A mangled question about the schedule still reads it out.
+        let got = run("word on my alarm");
+        assert!(format!("{got:?}").contains("ShowSchedule"), "{got:?}");
     }
 
     #[test]

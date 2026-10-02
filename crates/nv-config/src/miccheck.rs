@@ -30,8 +30,61 @@ pub struct MicState {
 }
 
 impl MicState {
+    fn new(name: String, is_default: bool, rate: u32) -> Arc<MicState> {
+        Arc::new(MicState {
+            name,
+            is_default,
+            rate,
+            level: Mutex::new(-100.0),
+            mode: Arc::new(AtomicU8::new(REC_OFF)),
+            quiet_blocks: Mutex::new(Vec::new()),
+            speak_blocks: Mutex::new(Vec::new()),
+            speak_audio: Mutex::new(Vec::new()),
+        })
+    }
+
     pub fn level(&self) -> f32 {
         *self.level.lock().unwrap()
+    }
+
+    // Each of these takes the locks it needs and drops them before returning.
+    // Holding two guards across one expression — a struct literal field list,
+    // for instance — deadlocks the moment the second lock touches a mutex the
+    // first one already holds, which is exactly what froze the settings window.
+
+    /// Background level for this mic, dBFS.
+    fn floor_db(&self) -> f32 {
+        let quiet = self.quiet_blocks.lock().unwrap();
+        let speak = self.speak_blocks.lock().unwrap();
+        noise_floor(&quiet, &speak)
+    }
+
+    /// Peak speech level, dBFS.
+    fn peak_db(&self) -> f32 {
+        let speak = self.speak_blocks.lock().unwrap();
+        percentile(&live(&speak), 0.95)
+    }
+
+    /// True once this mic has heard speech and then gone quiet again.
+    fn finished_speaking(&self) -> bool {
+        let floor = self.floor_db();
+        let blocks = self.speak_blocks.lock().unwrap();
+        let loud = |d: &f32| *d > floor + 10.0;
+        if blocks.iter().filter(|d| loud(d)).count() <= 15 {
+            return false;
+        }
+        let tail = blocks.len().saturating_sub(120); // ~1.2 s at 10 ms blocks
+        !blocks[tail..].iter().any(loud)
+    }
+
+    fn report(&self) -> MicReport {
+        MicReport { name: self.name.clone(), noise_db: self.floor_db(), speech_db: self.peak_db() }
+    }
+
+    fn clear(&self) {
+        self.quiet_blocks.lock().unwrap().clear();
+        self.speak_blocks.lock().unwrap().clear();
+        self.speak_audio.lock().unwrap().clear();
     }
 }
 
@@ -43,7 +96,7 @@ pub enum Phase {
     Analyzing,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct MicReport {
     pub name: String,
     pub noise_db: f32,
@@ -104,16 +157,8 @@ impl MicCheck {
                 let name = desc.name().to_string();
                 let Ok(sup) = d.default_input_config() else { continue };
                 let ch = sup.channels() as usize;
-                let state = Arc::new(MicState {
-                    is_default: Some(&name) == default.as_ref(),
-                    name,
-                    rate: sup.sample_rate(),
-                    level: Mutex::new(-100.0),
-                    mode: Arc::new(AtomicU8::new(REC_OFF)),
-                    quiet_blocks: Mutex::new(Vec::new()),
-                    speak_blocks: Mutex::new(Vec::new()),
-                    speak_audio: Mutex::new(Vec::new()),
-                });
+                let is_default = Some(&name) == default.as_ref();
+                let state = MicState::new(name, is_default, sup.sample_rate());
                 let st = state.clone();
                 let on_data = move |mono: Vec<f32>| {
                     let p = mono.iter().map(|s| s * s).sum::<f32>() / mono.len().max(1) as f32;
@@ -165,9 +210,7 @@ impl MicCheck {
 
     pub fn start(&mut self) {
         for m in &self.mics {
-            m.quiet_blocks.lock().unwrap().clear();
-            m.speak_blocks.lock().unwrap().clear();
-            m.speak_audio.lock().unwrap().clear();
+            m.clear();
             m.mode.store(REC_QUIET, Ordering::Relaxed);
         }
         self.result = None;
@@ -186,14 +229,7 @@ impl MicCheck {
             Phase::Speak(t) => {
                 let el = t.elapsed().as_secs_f32();
                 // Finish early once someone spoke and then went quiet for a bit.
-                let done_talking = el > 2.5 && self.mics.iter().any(|m| {
-                    let quiet = noise_floor(&m.quiet_blocks.lock().unwrap(), &m.speak_blocks.lock().unwrap());
-                    let blocks = m.speak_blocks.lock().unwrap();
-                    let loud = |d: &f32| *d > quiet + 10.0;
-                    let spoke = blocks.iter().filter(|d| loud(d)).count() > 15;
-                    let tail = blocks.len().saturating_sub(120); // ~1.2 s at 10 ms blocks
-                    spoke && !blocks[tail..].iter().any(loud)
-                });
+                let done_talking = el > 2.5 && self.mics.iter().any(|m| m.finished_speaking());
                 if el >= SPEAK_MAX_SECS || done_talking {
                     for m in &self.mics {
                         m.mode.store(REC_OFF, Ordering::Relaxed);
@@ -225,15 +261,7 @@ impl MicCheck {
     }
 
     fn analyze(&mut self, ctx: &eframe::egui::Context, _cfg: &Config) {
-        let reports: Vec<MicReport> = self
-            .mics
-            .iter()
-            .map(|m| MicReport {
-                name: m.name.clone(),
-                noise_db: noise_floor(&m.quiet_blocks.lock().unwrap(), &m.speak_blocks.lock().unwrap()),
-                speech_db: percentile(&live(&m.speak_blocks.lock().unwrap()), 0.95),
-            })
-            .collect();
+        let reports: Vec<MicReport> = self.mics.iter().map(|m| m.report()).collect();
         let best = reports.iter().filter(|r| r.snr() >= 8.0).max_by(|a, b| a.snr().total_cmp(&b.snr())).cloned();
         let Some(best) = best else {
             self.result = Some(Calibration {
@@ -296,6 +324,67 @@ impl MicCheck {
         self.pending = Some((cal, job, out));
         self.phase = Phase::Analyzing;
     }
+}
+
+/// Run the whole wizard without a window, for `--miccheck`: it opens every
+/// microphone, waits through both steps and returns what it measured. Handy for
+/// checking a machine's audio, and a smoke test that the analysis finishes.
+pub fn run_to_completion(
+    cfg: &Config,
+    ctx: &eframe::egui::Context,
+    limit: Duration,
+) -> Result<Calibration, String> {
+    let mut check = MicCheck::open();
+    if check.mics.is_empty() {
+        return Err("no microphone could be opened".into());
+    }
+    check.start();
+    let deadline = Instant::now() + limit;
+    while Instant::now() < deadline {
+        check.tick(ctx, cfg);
+        if check.phase == Phase::Idle {
+            return check.result.ok_or_else(|| "the check finished without a result".to_string());
+        }
+        std::thread::sleep(repaint());
+    }
+    Err(format!("the check didn't finish within {} seconds", limit.as_secs()))
+}
+
+/// The calibration as plain text, for the `--miccheck` report file.
+pub fn describe(cal: &Calibration) -> String {
+    let mut out = String::new();
+    for r in &cal.mics {
+        out.push_str(&format!(
+            "{} {}  — background {:.0} dB, voice {:.0} dB ({} dB clearer)
+",
+            if cal.best.as_deref() == Some(r.name.as_str()) { "✔" } else { "•" },
+            r.name,
+            r.noise_db,
+            r.speech_db,
+            r.snr().max(0.0).round()
+        ));
+    }
+    match &cal.best {
+        None => out.push_str("Couldn't hear you on any microphone.\n"),
+        Some(best) => {
+            out.push_str(&format!("Best: {best}\n"));
+            out.push_str(&format!("Mic boost: {:.0} dB\n", cal.gain_db));
+            out.push_str(&format!("Speech threshold: {:.0} dB, noise filtering {}\n", cal.min_speech_db, cal.vad));
+            match &cal.transcript {
+                Some(t) => out.push_str(&format!("Heard back: \"{}\"\n", t.trim())),
+                None => out.push_str("Heard back: (nothing)\n"),
+            }
+            out.push_str(&format!(
+                "Wake word recognised: {}{}\n",
+                if cal.wake_ok { "yes" } else { "no" },
+                match cal.sensitivity {
+                    Some(s) => format!(" (sensitivity {s:.2} would be needed)"),
+                    None => String::new(),
+                }
+            ));
+        }
+    }
+    out
 }
 
 fn resample(input: &[f32], from: u32, to: u32) -> Vec<f32> {
@@ -362,5 +451,88 @@ fn noise_floor(quiet: &[f32], speak: &[f32]) -> f32 {
         percentile(&q, 0.5)
     } else {
         percentile(&live(speak), 0.1)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mic(name: &str) -> Arc<MicState> {
+        MicState::new(name.to_string(), true, 48_000)
+    }
+
+    fn fill(blocks: &Mutex<Vec<f32>>, db: f32, n: usize) {
+        blocks.lock().unwrap().extend(std::iter::repeat(db).take(n));
+    }
+
+    /// Regression: the report used to lock the same mutex twice inside one
+    /// struct literal. Those guards overlap, so the second lock never returned
+    /// and the settings window froze on the last step of the mic check.
+    #[test]
+    fn building_a_report_does_not_deadlock() {
+        let m = mic("test mic");
+        fill(&m.quiet_blocks, -60.0, 100);
+        fill(&m.speak_blocks, -20.0, 200);
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(m.report());
+        });
+        match rx.recv_timeout(Duration::from_secs(5)) {
+            Ok(r) => {
+                assert_eq!(r.name, "test mic");
+                assert!(r.speech_db > r.noise_db, "{r:?}");
+            }
+            Err(_) => panic!("planning the report deadlocked"),
+        }
+    }
+
+    /// The same shape of bug, one level up: a report for every microphone.
+    #[test]
+    fn a_whole_batch_of_reports_finishes() {
+        let mics: Vec<Arc<MicState>> = (0..4).map(|i| mic(&format!("mic {i}"))).collect();
+        for m in &mics {
+            fill(&m.quiet_blocks, -55.0, 120);
+            fill(&m.speak_blocks, -18.0, 300);
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let reports: Vec<MicReport> = mics.iter().map(|m| m.report()).collect();
+            let _ = tx.send(reports.len());
+        });
+        assert_eq!(rx.recv_timeout(Duration::from_secs(5)).expect("deadlock"), 4);
+    }
+
+    #[test]
+    fn hears_speech_then_silence() {
+        let m = mic("talker");
+        fill(&m.quiet_blocks, -60.0, 300);
+        fill(&m.speak_blocks, -60.0, 50);
+        fill(&m.speak_blocks, -20.0, 60);
+        fill(&m.speak_blocks, -60.0, 200);
+        assert!(m.finished_speaking(), "should stop once they go quiet");
+
+        let still = mic("still talking");
+        fill(&still.quiet_blocks, -60.0, 300);
+        fill(&still.speak_blocks, -20.0, 200);
+        assert!(!still.finished_speaking(), "should not stop mid-sentence");
+    }
+
+    #[test]
+    fn silence_reads_as_silence() {
+        let m = mic("dead mic");
+        fill(&m.quiet_blocks, -90.0, 300);
+        fill(&m.speak_blocks, -90.0, 300);
+        let r = m.report();
+        assert!(r.snr() < 8.0, "silence must not look like a clear voice: {r:?}");
+    }
+
+    #[test]
+    fn a_loud_room_needs_more_filtering() {
+        let m = mic("noisy");
+        fill(&m.quiet_blocks, -35.0, 300);
+        fill(&m.speak_blocks, -20.0, 300);
+        let r = m.report();
+        assert!(r.snr() < 20.0 && r.snr() > 5.0, "{r:?}");
     }
 }
