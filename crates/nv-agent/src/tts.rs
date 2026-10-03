@@ -335,15 +335,26 @@ fn load_kokoro(name: &str, threads: u32) -> Option<(OfflineTts, i32)> {
     OfflineTts::create(&c).map(|t| (t, v.sid))
 }
 
-/// `n` samples of noise at about -60 dBFS: inaudible, but not silence.
+/// A signal that keeps an audio link awake without being audible.
+///
+/// Two things matter. Level: at -78 dBFS it is 18 dB quieter than the first
+/// attempt, which was audible as a hiss in a quiet room. Spectrum: white noise
+/// is the most noticeable thing you can play at a given level, so this changes
+/// value only every few hundred samples — a slow rumble below about 150 Hz,
+/// which is far harder to hear on any speaker or headset.
 fn dither(n: usize) -> Vec<f32> {
+    const SLOW: usize = 320; // ~150 Hz at 48 kHz
     let mut seed: u32 = 0x9E37_79B9;
+    let mut value = 0.0f32;
     (0..n)
-        .map(|_| {
-            seed ^= seed << 13;
-            seed ^= seed >> 17;
-            seed ^= seed << 5;
-            ((seed >> 8) as f32 / 8_388_608.0 - 1.0) * 0.001
+        .map(|i| {
+            if i % SLOW == 0 {
+                seed ^= seed << 13;
+                seed ^= seed >> 17;
+                seed ^= seed << 5;
+                value = ((seed >> 8) as f32 / 8_388_608.0 - 1.0) * 0.00013;
+            }
+            value
         })
         .collect()
 }
@@ -360,9 +371,11 @@ struct Player {
     /// Sample rate the speech arrives at.
     rate: u32,
     volume: u8,
-    /// When it last had something to say, for deciding how much silence to
-    /// prime with.
+    /// When it last had something to say, for deciding how much lead-in to give.
     last_used: Instant,
+    /// Until when the output keeps a whisper of signal going, so a link that
+    /// suspends on silence is already awake when the reply starts.
+    keep_alive: Arc<Mutex<Instant>>,
 }
 
 #[derive(Clone)]
@@ -410,26 +423,36 @@ impl Player {
         let queue = Arc::new(Mutex::new(VecDeque::<f32>::new()));
         let gain = volume.min(100) as f32 / 100.0;
 
+        let keep_alive = Arc::new(Mutex::new(Instant::now()));
+        let dump = std::env::var("NV_DUMP_TTS").ok().map(|_| Arc::new(Mutex::new(Vec::<f32>::new())));
+        let dump_in_callback = dump.clone();
         let q = queue.clone();
+        let awake_until = keep_alive.clone();
         let mut env = 0.0f32;
-        // When there is nothing to play, play this instead of digital silence.
-        let mut dither: u32 = 0x1234_5678;
-        let mut idle = move || {
-            dither ^= dither << 13;
-            dither ^= dither >> 17;
-            dither ^= dither << 5;
-            // ±0.001, about -60 dBFS: inaudible, but not silence.
-            ((dither >> 8) as f32 / 8_388_608.0 - 1.0) * 0.001
-        };
+        // Only while a reply is on its way or just past: the rest of the time the
+        // output is genuinely silent, because a constant whisper is worse than
+        // the clipped syllable it was meant to prevent.
+        let idle = dither(64 * 1024);
+        let mut idle_at = idle.len();
         let mut fill = move |out: &mut dyn FnMut(usize, f32), frames: usize| {
             let mut q = q.lock().unwrap();
+            let whisper = Instant::now() < *awake_until.lock().unwrap();
             let mut sum = 0.0;
             for i in 0..frames {
                 let s = match q.pop_front() {
                     Some(v) => v * gain,
-                    // Not silence: a suspended Bluetooth link is what clips the
-                    // first syllable of a reply.
-                    None => idle(),
+                    None if whisper => {
+                        if idle_at >= idle.len() {
+                            idle_at = 0;
+                        }
+                        idle_at += 1;
+                        let v = idle[idle_at - 1];
+                        if let Some(dump) = &dump_in_callback {
+                            dump.lock().unwrap().push(v);
+                        }
+                        v
+                    }
+                    None => 0.0,
                 };
                 sum += s * s;
                 for c in 0..channels {
@@ -468,7 +491,6 @@ impl Player {
         }
         .map_err(|e| e.to_string())?;
         stream.play().map_err(|e| e.to_string())?;
-        let dump = std::env::var("NV_DUMP_TTS").ok().map(|_| Arc::new(Mutex::new(Vec::<f32>::new())));
         let feeder = Feeder {
             queue,
             step: src_rate as f64 / rate as f64,
@@ -477,7 +499,7 @@ impl Player {
             rate,
         };
         log::info!("speakers: {} ({rate} Hz, {channels} ch, {format:?})", device_name(&device));
-        Ok(Player { _stream: stream, feeder, rate: src_rate, volume, last_used: Instant::now() })
+        Ok(Player { _stream: stream, feeder, rate: src_rate, volume, last_used: Instant::now(), keep_alive })
     }
 
     fn feeder(&self) -> Feeder {
@@ -494,7 +516,14 @@ impl Player {
     /// leading sound happens while the user is still talking.
     fn prime_hard(&mut self) {
         self.prime_for(400);
+        self.wake_for(Duration::from_secs(20));
         self.last_used = Instant::now();
+    }
+
+    /// Keep the output awake for this long: from the wake word until well after
+    /// the reply, and no longer.
+    fn wake_for(&self, how_long: Duration) {
+        *self.keep_alive.lock().unwrap() = Instant::now() + how_long;
     }
 
     fn prime(&mut self) {
@@ -533,6 +562,27 @@ impl Player {
         // Let the device drain its own buffer.
         std::thread::sleep(Duration::from_millis(150));
         self.dump_sent();
+        // Two seconds of grace, then silence: the link stays up across a reply
+        // and its tail, not for the rest of the session.
+        self.wake_for(Duration::from_secs(2));
         self.last_used = Instant::now();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_keep_alive_signal_is_inaudible_and_slow() {
+        let d = dither(48_000);
+        let peak = d.iter().fold(0f32, |m, s| m.max(s.abs()));
+        // -78 dBFS peak: a fifth of a percent of full scale.
+        assert!(peak < 0.0003, "peak {peak} is loud enough to hear");
+        assert!(peak > 0.0, "it has to be a signal, not silence");
+        // Slow: it should change value only every few hundred samples, which is
+        // what stops it sounding like a hiss.
+        let changes = d.windows(2).filter(|w| w[0] != w[1]).count();
+        assert!(changes < d.len() / 100, "{changes} changes in {} samples is a hiss", d.len());
     }
 }
