@@ -356,6 +356,7 @@ pub fn run(cfg: Config, shared: Arc<Shared>, apps: Arc<RwLock<AppIndex>>, tts: A
                             }
                         }
                         Phase::Command { has_wake } => {
+                            log::info!("segment: {}", describe_audio(&s.audio, s.speech_frames));
                             let text = transcribe(&mut stt, &mut loading, &s.audio);
                             let hit = wake::detect(&text, &cfg);
                             // Saying the name again with nothing after it just
@@ -376,6 +377,13 @@ pub fn run(cfg: Config, shared: Arc<Shared>, apps: Arc<RwLock<AppIndex>>, tts: A
                                 phase = handle_command(&command, &cfg, &mut brain, &apps, &shared, &tts, speaker.as_ref());
                                 drain(mic.as_ref());
                             } else if has_wake {
+                                // Heard the name, understood nothing. Going quiet
+                                // looks like being dismissed, so ask.
+                                log::info!("nothing usable in that segment");
+                                shared.set_mode(Mode::Listening);
+                                if tts.active() {
+                                    tts.say(&personality::line(cfg.personality, &Moment::Unclear));
+                                }
                                 phase = Phase::Await { deadline: Instant::now() + secs(cfg.command_timeout_secs) };
                             } else {
                                 shared.set_mode(Mode::Hidden);
@@ -495,6 +503,23 @@ fn check_timeout(phase: &mut Phase, shared: &Shared) {
             *phase = Phase::Idle;
         }
     }
+}
+
+/// What a segment contained, for the log: an empty transcript means the audio
+/// was the problem, and this says which kind of problem.
+fn describe_audio(audio: &[f32], speech_frames: u32) -> String {
+    if audio.is_empty() {
+        return "no audio".to_string();
+    }
+    let peak = audio.iter().fold(0f32, |m, s| m.max(s.abs()));
+    let rms = (audio.iter().map(|s| s * s).sum::<f32>() / audio.len() as f32).sqrt();
+    let ms = audio.len() as f32 * 1000.0 / RATE as f32;
+    format!(
+        "{ms:.0} ms, {} speech frames, peak {:.0} dBFS, rms {:.0} dBFS",
+        speech_frames,
+        20.0 * peak.max(1e-9).log10(),
+        20.0 * rms.max(1e-9).log10()
+    )
 }
 
 /// Transcribe, waiting for a warm-up that is still running and starting one if
