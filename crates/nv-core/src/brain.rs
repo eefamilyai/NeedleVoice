@@ -234,20 +234,35 @@ impl Brain {
             }
         };
         self.last_used = Instant::now();
+
+        // "Disengage" is the model's way of giving up: shown a half-heard
+        // sentence it picks the one tool that means "forget it", and the answer
+        // is a cheerful "Okay!" that looks like the assistant dismissing you.
+        // It only counts when the words really are a dismissal.
+        let mut actions = actions;
+        if actions.iter().any(|a| matches!(a, Action::Disengage)) && !looks_like_a_dismissal(&command, cfg) {
+            log::info!("not disengaging for {command:?} — that is not a dismissal");
+            actions.retain(|a| !matches!(a, Action::Disengage));
+        }
+
         // A command to *do* something must not become a search for the sentence
-        // itself. "delete all my alarms" had no matching function, and the
-        // answer was a web search for those exact words, which is worse than
-        // admitting it did not understand.
-        let actions = if actions.iter().any(|a| matches!(a, Action::WebSearch(_)))
+        // itself: "delete all my alarms" was answered with a web search for
+        // exactly those words, which is worse than admitting it did not
+        // understand.
+        let refused = actions.iter().any(|a| matches!(a, Action::WebSearch(_)))
             && looks_like_a_command(&command)
-            && !is_a_search_request(&command)
-        {
+            && !is_a_search_request(&command);
+        if refused {
             log::info!("not searching for what looks like a command: {command:?}");
-            Vec::new()
-        } else {
-            actions
-        };
+            actions.clear();
+        }
+
+        // Nothing understood, and nothing worth guessing at: say so rather than
+        // searching or "doing" an empty list of things.
         if actions.is_empty() {
+            if refused {
+                return Decision { actions, via: Via::Needle, reasoning, millis: t.elapsed().as_millis() };
+            }
             return Decision {
                 actions: vec![Action::WebSearch(command)],
                 via: Via::Fallback,
@@ -550,6 +565,26 @@ const IMPERATIVES: &[&str] = &[
     "disengage", "forget", "empty", "dump", "throw", "get rid", "swap", "change", "switch", "enable",
     "disable", "block", "unblock", "send", "call", "text", "email", "print", "copy", "move", "rename",
 ];
+
+/// Is this really a dismissal, or did the model just give up?
+///
+/// A phrase-list hit, or nothing but waiting-speak, counts. A half-heard
+/// sentence does not.
+fn looks_like_a_dismissal(text: &str, cfg: &Config) -> bool {
+    if asks_to_wait(text, cfg) {
+        return true;
+    }
+    if crate::tools::match_any_phrase(cfg, text).is_some_and(|hit| hit.tool == "disengage") {
+        return true;
+    }
+    // "never mind all that" and other short dismissals the phrase list misses.
+    const WORDS: [&str; 14] = [
+        "never mind", "nevermind", "forget it", "forget that", "changed my mind", "no thanks", "thats all",
+        "thats it", "stop listening", "stand down", "disengage", "turn off", "go back to sleep", "as you were",
+    ];
+    let plain = crate::fuzzy::normalize(text);
+    plain.split(' ').count() <= 6 && WORDS.iter().any(|w| plain.contains(w))
+}
 
 /// Does this read as an instruction rather than a question?
 #[cfg(test)]
@@ -1054,6 +1089,59 @@ mod tests {
                 "{said:?} should read the schedule out: {got:?}"
             );
         }
+    }
+
+    #[test]
+    fn no_ordinary_command_dismisses_or_searches() {
+        let cfg = Config::default();
+        let apps = index();
+        // Every one of these was said at some point and answered wrongly.
+        for said in [
+            "reminder to call my mum at four",
+            "minder to call my mum",
+            "delete all my alarms",
+            "set an alarm for 7 30 in the morning",
+            "open chrome",
+            "play some music",
+            "what is the time right now",
+            "how do i fix a leaking tap",
+            "take a screenshot",
+            "turn up the volume",
+            "lock the pc",
+            "add buy milk to my list",
+            "what is on my schedule",
+            "list my reminders",
+            "mark buy milk as done",
+            "cancel my 7 30 alarm",
+        ] {
+            let got = instant(&clean_command(said, &cfg), &cfg, &apps);
+            if let Some(actions) = &got {
+                assert!(
+                    !actions.iter().any(|a| matches!(a, Action::Disengage)),
+                    "{said:?} disengaged: {actions:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn saying_you_did_not_mean_it_still_dismisses() {
+        let cfg = Config::default();
+        for said in ["never mind", "never mind that", "forget it", "stand down", "hold on a second", "wait"] {
+            assert!(looks_like_a_dismissal(&clean_command(said, &cfg), &cfg), "{said:?} should dismiss");
+        }
+        // A half-heard sentence is not a dismissal, however short.
+        for said in ["minder to call my mum", "delete all my alarms", "open chrome", "set an alarm for 7"] {
+            assert!(!looks_like_a_dismissal(&clean_command(said, &cfg), &cfg), "{said:?} is not a dismissal");
+        }
+    }
+
+    #[test]
+    fn an_understood_nothing_reply_is_not_a_dismissal() {
+        let cfg = Config::default();
+        let said = crate::personality::reply(&cfg, &[]);
+        assert!(!said.contains("All done"), "empty batch said {said:?}");
+        assert!(!said.contains('0'), "empty batch said {said:?}");
     }
 
     #[test]

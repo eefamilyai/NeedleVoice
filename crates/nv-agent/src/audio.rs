@@ -52,16 +52,40 @@ impl Mic {
 
     fn open_device(device: cpal::Device) -> Result<Mic, String> {
         let device_name = device_name(&device);
-        let supported = device.default_input_config().map_err(|e| e.to_string())?;
-        let channels = supported.channels() as usize;
-        let in_rate = supported.sample_rate();
-        let format = supported.sample_format();
-        let config: cpal::StreamConfig = supported.into();
+        // Most webcam and headset microphones can deliver 16 kHz themselves. It
+        // is worth asking: resampling 48 kHz down by three with a gentle filter
+        // folds everything above 2.6 kHz back into the speech band, which is
+        // exactly the band the recogniser needs for consonants.
+        let native = device
+            .supported_input_configs()
+            .ok()
+            .into_iter()
+            .flatten()
+            .filter(|c| c.min_sample_rate() <= RATE && c.max_sample_rate() >= RATE && c.sample_format() == cpal::SampleFormat::F32)
+            .min_by_key(|c| c.channels())
+            .map(|c| c.with_sample_rate(RATE).config());
+        let (supported, config) = match native {
+            Some(config) => {
+                log::info!("microphone: {device_name} captured natively at 16 kHz");
+                (None, config)
+            }
+            None => {
+                let supported = device.default_input_config().map_err(|e| e.to_string())?;
+                let config: cpal::StreamConfig = supported.clone().into();
+                (Some(supported), config)
+            }
+        };
+        let channels = config.channels as usize;
+        let in_rate = config.sample_rate;
+        let format = supported.as_ref().map(|s| s.sample_format()).unwrap_or(cpal::SampleFormat::F32);
         log::info!("microphone: {device_name} ({in_rate} Hz, {channels} ch, {format:?})");
 
-        // Bounded so a stalled consumer can't grow memory; chunks are dropped instead.
-        let (tx, rx) = sync_channel::<Vec<f32>>(256);
+        // Generous, because a dropped chunk is a hole in the middle of a word:
+        // the consumer stalls for a moment whenever the brain or a model load
+        // runs, and ten seconds of slack costs a couple of megabytes.
+        let (tx, rx) = sync_channel::<Vec<f32>>(1024);
         let mut rs = Resampler::new(in_rate, RATE);
+        let mut dropped: u64 = 0;
 
         // Over/underruns are harmless glitches (e.g. while a game hogs the CPU).
         let err = |e: cpal::Error| {
@@ -80,8 +104,14 @@ impl Mic {
                             .map(|f| f.iter().map(|&s| $conv(s)).sum::<f32>() / channels as f32)
                             .collect();
                         let out = rs.process(&mono);
-                        if !out.is_empty() {
-                            let _ = tx.try_send(out);
+                        if !out.is_empty() && tx.try_send(out).is_err() {
+                            // Full buffer: the listener is behind. Counting it is
+                            // the difference between "a word went missing" and
+                            // knowing why.
+                            dropped += 1;
+                            if dropped % 50 == 1 {
+                                log::warn!("microphone: {dropped} chunks dropped (listener behind)");
+                            }
                         }
                     },
                     err,
@@ -109,6 +139,7 @@ struct Resampler {
     pos: f64,
     prev: f32,
     lp: f32,
+    lp2: f32,
     alpha: f32,
 }
 
@@ -118,15 +149,18 @@ impl Resampler {
         let fc = to as f32 * 0.45;
         let dt = 1.0 / from as f32;
         let rc = 1.0 / (2.0 * std::f32::consts::PI * fc);
-        Self { step: from as f64 / to as f64, pos: 0.0, prev: 0.0, lp: 0.0, alpha: dt / (rc + dt) }
+        Self { step: from as f64 / to as f64, pos: 0.0, prev: 0.0, lp: 0.0, lp2: 0.0, alpha: dt / (rc + dt) }
     }
 
     fn process(&mut self, input: &[f32]) -> Vec<f32> {
         let mut out = Vec::with_capacity((input.len() as f64 / self.step) as usize + 2);
         for &x in input {
+            // Two poles rather than one: a single pole is -6 dB per octave, which
+            // leaves far too much above the new Nyquist for a 3× decimation.
             let filtered = if self.step > 1.0 {
                 self.lp += self.alpha * (x - self.lp);
-                self.lp
+                self.lp2 += self.alpha * (self.lp - self.lp2);
+                self.lp2
             } else {
                 x
             };

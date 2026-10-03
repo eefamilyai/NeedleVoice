@@ -131,6 +131,8 @@ pub fn run(cfg: Config, shared: Arc<Shared>, apps: Arc<RwLock<AppIndex>>, tts: A
     let mut spotter_quiet_ms = 0u32;
     // Ignore the mic briefly after waking so the chime isn't taken as speech.
     let mut deaf_frames: u32 = 0;
+    // Set when the pre-roll holds our own voice, so only its tail is used.
+    let mut after_reply = false;
 
     log::info!("listening for \"{}\"", cfg.wake_phrase());
 
@@ -225,10 +227,23 @@ pub fn run(cfg: Config, shared: Arc<Shared>, apps: Arc<RwLock<AppIndex>>, tts: A
             if speaking || was_speaking {
                 was_speaking = speaking;
                 if !matches!(phase, Phase::Command { .. }) {
+                    // Roll the pre-roll along instead of throwing it away: people
+                    // start the next command over the reply, and deleting those
+                    // frames is how a first syllable goes missing. The segment
+                    // that follows trims the pre-roll back to the last few
+                    // hundred milliseconds, so the reply itself does not end up
+                    // in the transcript.
+                    preroll.push_back(frame);
+                    if preroll.len() > PREROLL_FRAMES {
+                        preroll.pop_front();
+                    }
+                    after_reply = true;
                     seg = None;
-                    preroll.clear();
                     continue;
                 }
+            }
+            if !speaking {
+                after_reply = false;
             }
 
             let rms = (frame.iter().map(|s| s * s).sum::<f32>() / FRAME as f32).sqrt();
@@ -297,7 +312,7 @@ pub fn run(cfg: Config, shared: Arc<Shared>, apps: Arc<RwLock<AppIndex>>, tts: A
                 speech
             };
 
-            let outcome = step(&mut seg, &mut preroll, &frame, speech, &phase, &cfg);
+            let outcome = step(&mut seg, &mut preroll, &frame, speech, &phase, &cfg, after_reply);
             match outcome {
                 Step::Nothing => {}
                 Step::EarlyCheck => {
@@ -420,6 +435,7 @@ fn step(
     speech: bool,
     phase: &Phase,
     cfg: &Config,
+    after_reply: bool,
 ) -> Step {
     match seg {
         None => {
@@ -428,8 +444,12 @@ fn step(
                 preroll.pop_front();
             }
             if speech {
+                // Our own voice in the pre-roll is worth avoiding: keep only the
+                // last 300 ms of it when we have just been talking.
+                let keep = if after_reply { 10 } else { usize::MAX };
+                let skip = preroll.len().saturating_sub(keep);
                 let mut audio = Vec::with_capacity(RATE as usize * 4);
-                for f in preroll.drain(..) {
+                for f in preroll.drain(..).skip(skip) {
                     audio.extend_from_slice(&f);
                 }
                 *seg = Some(Segment { audio, speech_frames: 1, silence_frames: 0, early_checked: false, rejected: false });

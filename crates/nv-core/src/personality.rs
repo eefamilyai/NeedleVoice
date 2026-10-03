@@ -42,6 +42,7 @@ pub fn reply(cfg: &Config, outcomes: &[Outcome]) -> String {
         return line(cfg.personality, &Moment::Failed(action, why));
     }
     match outcomes {
+        [] => line(cfg.personality, &Moment::Unclear),
         [Outcome::Done(action, message)] => single(cfg, action, message),
         many => line(cfg.personality, &Moment::Multi(many.len())),
     }
@@ -84,6 +85,8 @@ pub enum Moment<'a> {
     Failed(&'a Action, &'a str),
     /// Woken but nothing was said.
     Timeout,
+    /// Heard something, understood none of it.
+    Unclear,
     /// Several actions done at once.
     Multi(usize),
 }
@@ -170,6 +173,12 @@ pub fn line(persona: Persona, moment: &Moment) -> String {
             Chill => &["All good.", "Later."],
             Sarcastic => &["Riveting conversation.", "Okay, never mind then."],
             Butler => &["Very well. I shall wait.", "Do call if you need me."],
+        }),
+        Moment::Unclear => pick(match persona {
+            Cheerful => &["Sorry, I didn't catch that one. Say it again?", "Hmm, I didn't get that."],
+            Chill => &["Didn't catch that.", "Say that again?"],
+            Sarcastic => &["I heard words. Just not a sentence I can do anything with."],
+            Butler => &["I beg your pardon — I didn't quite catch that.", "I'm afraid I missed that."],
         }),
         Moment::Multi(_) => pick(match persona {
             Cheerful => &["All done! Opened {n} things for you.", "Boom, {n} for {n}!"],
