@@ -335,6 +335,19 @@ fn load_kokoro(name: &str, threads: u32) -> Option<(OfflineTts, i32)> {
     OfflineTts::create(&c).map(|t| (t, v.sid))
 }
 
+/// `n` samples of noise at about -60 dBFS: inaudible, but not silence.
+fn dither(n: usize) -> Vec<f32> {
+    let mut seed: u32 = 0x9E37_79B9;
+    (0..n)
+        .map(|_| {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            ((seed >> 8) as f32 / 8_388_608.0 - 1.0) * 0.001
+        })
+        .collect()
+}
+
 fn device_name(d: &cpal::Device) -> String {
     d.description().map(|d| d.name().to_string()).unwrap_or_default()
 }
@@ -357,6 +370,10 @@ struct Feeder {
     queue: Arc<Mutex<VecDeque<f32>>>,
     step: f64,
     state: Arc<Mutex<(f64, f32)>>, // (fractional position, previous sample)
+    /// When set, everything queued for the device is also kept, so what we sent
+    /// can be compared with what was heard.
+    dump: Option<Arc<Mutex<Vec<f32>>>>,
+    rate: u32,
 }
 
 impl Feeder {
@@ -374,6 +391,9 @@ impl Feeder {
             prev = x;
         }
         *st = (pos, prev);
+        if let Some(dump) = &self.dump {
+            dump.lock().unwrap().extend_from_slice(&out);
+        }
         self.queue.lock().unwrap().extend(out);
     }
 }
@@ -392,11 +412,25 @@ impl Player {
 
         let q = queue.clone();
         let mut env = 0.0f32;
+        // When there is nothing to play, play this instead of digital silence.
+        let mut dither: u32 = 0x1234_5678;
+        let mut idle = move || {
+            dither ^= dither << 13;
+            dither ^= dither >> 17;
+            dither ^= dither << 5;
+            // ±0.001, about -60 dBFS: inaudible, but not silence.
+            ((dither >> 8) as f32 / 8_388_608.0 - 1.0) * 0.001
+        };
         let mut fill = move |out: &mut dyn FnMut(usize, f32), frames: usize| {
             let mut q = q.lock().unwrap();
             let mut sum = 0.0;
             for i in 0..frames {
-                let s = q.pop_front().unwrap_or(0.0) * gain;
+                let s = match q.pop_front() {
+                    Some(v) => v * gain,
+                    // Not silence: a suspended Bluetooth link is what clips the
+                    // first syllable of a reply.
+                    None => idle(),
+                };
                 sum += s * s;
                 for c in 0..channels {
                     out(i * channels + c, s);
@@ -434,10 +468,13 @@ impl Player {
         }
         .map_err(|e| e.to_string())?;
         stream.play().map_err(|e| e.to_string())?;
+        let dump = std::env::var("NV_DUMP_TTS").ok().map(|_| Arc::new(Mutex::new(Vec::<f32>::new())));
         let feeder = Feeder {
             queue,
             step: src_rate as f64 / rate as f64,
             state: Arc::new(Mutex::new((0.0, 0.0))),
+            dump,
+            rate,
         };
         log::info!("speakers: {} ({rate} Hz, {channels} ch, {format:?})", device_name(&device));
         Ok(Player { _stream: stream, feeder, rate: src_rate, volume, last_used: Instant::now() })
@@ -454,18 +491,37 @@ impl Player {
     /// play is the first phoneme of the reply — which is why "Reminder" arrives
     /// as "minder". A little silence costs nothing and gives them that moment.
     /// Wake the device properly: used when the wake word is heard, where the
-    /// silence happens while the user is still talking.
+    /// leading sound happens while the user is still talking.
     fn prime_hard(&mut self) {
-        let silence = vec![0.0f32; (self.rate as u64 * 400 / 1000) as usize];
-        self.feeder.push(&silence);
+        self.prime_for(400);
         self.last_used = Instant::now();
     }
 
     fn prime(&mut self) {
         let cold = self.last_used.elapsed() > Duration::from_secs(2);
-        let ms = if cold { 300 } else { 40 };
-        let silence = vec![0.0f32; (self.rate as u64 * ms / 1000) as usize];
-        self.feeder.push(&silence);
+        self.prime_for(if cold { 300 } else { 40 });
+    }
+
+    /// Lead-in before speech, at about -60 dBFS.
+    ///
+    /// Deliberately *not* digital silence: a Bluetooth link suspends when the
+    /// stream is silent, and a suspended link loses the first samples it is
+    /// given — which is why "Reminder" arrives as "minder". A noise floor too
+    /// quiet to hear keeps the link up and the word whole.
+    fn prime_for(&mut self, ms: u32) {
+        let n = (self.rate as u64 * ms as u64 / 1000) as usize;
+        self.feeder.push(&dither(n));
+    }
+
+    /// Write what was queued for the device, if `NV_DUMP_TTS` names a folder.
+    fn dump_sent(&self) {
+        let (Some(dump), Ok(dir)) = (&self.feeder.dump, std::env::var("NV_DUMP_TTS")) else { return };
+        let samples = dump.lock().unwrap();
+        let stamp = nv_core::schedule::Stamp::now().clock().replace(':', "");
+        let path = std::path::Path::new(&dir).join(format!("sent-{stamp}.wav"));
+        let _ = std::fs::create_dir_all(&dir);
+        let _ = crate::stt::write_wav_at(&path, &samples, self.feeder.rate);
+        log::info!("sent {} samples ({} ms) to the device -> {}", samples.len(), samples.len() as f32 * 1000.0 / self.feeder.rate as f32, path.display());
     }
 
     /// Block until everything queued has played, without closing the device.
@@ -476,6 +532,7 @@ impl Player {
         }
         // Let the device drain its own buffer.
         std::thread::sleep(Duration::from_millis(150));
+        self.dump_sent();
         self.last_used = Instant::now();
     }
 }

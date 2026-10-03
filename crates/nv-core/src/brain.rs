@@ -249,11 +249,30 @@ impl Brain {
         // itself: "delete all my alarms" was answered with a web search for
         // exactly those words, which is worse than admitting it did not
         // understand.
-        let refused = actions.iter().any(|a| matches!(a, Action::WebSearch(_)))
+        let refused = (actions.iter().any(|a| matches!(a, Action::WebSearch(_)))
             && looks_like_a_command(&command)
-            && !is_a_search_request(&command);
+            && !is_a_search_request(&command))
+            // A single word that matched nothing is far more likely to be a
+            // mis-hearing than a topic worth searching for.
+            || (actions.iter().any(|a| matches!(a, Action::WebSearch(_)))
+                && command.split(' ').count() <= 2
+                && !is_a_search_request(&command));
         if refused {
             log::info!("not searching for what looks like a command: {command:?}");
+            actions.clear();
+        }
+
+        // A tool call missing the one thing it needed is not an answer either:
+        // "open" with no app, or a search with no query. Better to ask again.
+        let half_an_answer = actions.iter().any(|a| match a {
+            Action::OpenApp(app) | Action::CloseApp(app) => app.trim().is_empty(),
+            Action::WebSearch(q) | Action::YoutubeSearch(q) => q.trim().is_empty(),
+            Action::OpenWebsite(url) => url.trim().is_empty(),
+            Action::Custom { params, .. } => params.iter().all(|(_, v)| v.trim().is_empty()),
+            _ => false,
+        });
+        if half_an_answer {
+            log::info!("asking again: {command:?} did not say enough to act on");
             actions.clear();
         }
 
@@ -1142,6 +1161,23 @@ mod tests {
         let said = crate::personality::reply(&cfg, &[]);
         assert!(!said.contains("All done"), "empty batch said {said:?}");
         assert!(!said.contains('0'), "empty batch said {said:?}");
+    }
+
+    #[test]
+    fn a_half_heard_command_asks_again() {
+        let cfg = Config::default();
+        // A web search for one or two words is almost always a mis-hearing.
+        for said in ["minder", "remind me", "alarm"] {
+            assert!(
+                is_a_search_request(&clean_command(said, &cfg)) == false,
+                "{said:?} should not be treated as a search topic"
+            );
+        }
+        // A tool call with nothing in it is not an answer.
+        let empty = serde_json::json!({});
+        assert!(action_from_call("open_app", &empty, &cfg).is_none());
+        let blank = serde_json::json!({"app": "  "});
+        assert!(action_from_call("open_app", &blank, &cfg).is_none());
     }
 
     #[test]

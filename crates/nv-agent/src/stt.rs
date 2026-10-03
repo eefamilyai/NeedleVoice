@@ -311,6 +311,11 @@ impl Stt {
 
 /// Write 16 kHz mono f32 samples as a 16-bit WAV. Used by the dump above.
 fn write_wav(path: &std::path::Path, samples: &[f32]) -> std::io::Result<()> {
+    write_wav_at(path, samples, crate::audio::RATE)
+}
+
+/// Write mono f32 samples as a 16-bit WAV at any rate.
+pub fn write_wav_at(path: &std::path::Path, samples: &[f32], rate: u32) -> std::io::Result<()> {
     use std::io::Write;
     let mut f = std::io::BufWriter::new(std::fs::File::create(path)?);
     let data_len = (samples.len() * 2) as u32;
@@ -320,8 +325,8 @@ fn write_wav(path: &std::path::Path, samples: &[f32]) -> std::io::Result<()> {
     f.write_all(&16u32.to_le_bytes())?;
     f.write_all(&1u16.to_le_bytes())?;
     f.write_all(&1u16.to_le_bytes())?;
-    f.write_all(&crate::audio::RATE.to_le_bytes())?;
-    f.write_all(&(crate::audio::RATE * 2).to_le_bytes())?;
+    f.write_all(&rate.to_le_bytes())?;
+    f.write_all(&(rate * 2).to_le_bytes())?;
     f.write_all(&2u16.to_le_bytes())?;
     f.write_all(&16u16.to_le_bytes())?;
     f.write_all(b"data")?;
