@@ -39,12 +39,19 @@ impl Tts {
             nv_core::win::com_init();
             let idle = Duration::from_secs(cfg.unload_after_secs.max(5));
             let mut voice: Option<Voice> = None;
+            // Kept open across replies so the output device stays awake.
+            let mut player: Option<Player> = None;
             let mut last_used = Instant::now();
             loop {
                 match rx.recv_timeout(Duration::from_secs(1)) {
                     Ok(Msg::Prepare) => {
                         if voice.is_none() {
                             voice = Voice::load(&cfg);
+                        }
+                        // Wake the output device now, while the command is still
+                        // being spoken, so the reply starts the moment it is ready.
+                        if let Some(p) = ensure_player(&voice, &cfg, &shared, &mut player) {
+                            p.prime_hard();
                         }
                         last_used = Instant::now();
                     }
@@ -61,7 +68,7 @@ impl Tts {
                         }
                         shared.set_speaking(true);
                         match &voice {
-                            Some(v) => v.speak(&text, &cfg, &shared),
+                            Some(v) => v.speak(&text, &cfg, &shared, &mut player),
                             None => log::warn!("no voice available"),
                         }
                         shared.set_level(0.0);
@@ -71,6 +78,7 @@ impl Tts {
                     Err(RecvTimeoutError::Timeout) => {
                         if voice.is_some() && last_used.elapsed() > idle {
                             voice = None;
+                            player = None;
                             log::info!("voice unloaded (idle)");
                         }
                     }
@@ -128,12 +136,49 @@ impl nv_core::actions::Speaker for AgentVoice {
     }
 }
 
+/// Synthesise `text` with the configured voice and write it as a WAV, without
+/// playing anything. Separating the two is the only way to tell a voice that
+/// clips a word from a player that does.
+pub fn synthesize_to_wav(cfg: &Config, text: &str, out: &std::path::Path) -> Result<(), String> {
+    nv_core::win::com_init();
+    let Some(Voice::Neural { tts, sid }) = Voice::load(cfg) else {
+        return Err("the configured voice is not a neural one".into());
+    };
+    let gen = GenerationConfig { sid, speed: cfg.voice_speed, ..Default::default() };
+    let audio = tts
+        .generate_with_config(text, &gen, None::<fn(&[f32], f32) -> bool>)
+        .ok_or("synthesis failed")?;
+    let samples = audio.samples();
+    let rate = tts.sample_rate() as u32;
+    let mut bytes = Vec::with_capacity(44 + samples.len() * 2);
+    let data_len = (samples.len() * 2) as u32;
+    bytes.extend(b"RIFF");
+    bytes.extend((36 + data_len).to_le_bytes());
+    bytes.extend(b"WAVEfmt ");
+    bytes.extend(16u32.to_le_bytes());
+    bytes.extend(1u16.to_le_bytes());
+    bytes.extend(1u16.to_le_bytes());
+    bytes.extend(rate.to_le_bytes());
+    bytes.extend((rate * 2).to_le_bytes());
+    bytes.extend(2u16.to_le_bytes());
+    bytes.extend(16u16.to_le_bytes());
+    bytes.extend(b"data");
+    bytes.extend(data_len.to_le_bytes());
+    for s in samples {
+        bytes.extend(((s.clamp(-1.0, 1.0) * 32767.0) as i16).to_le_bytes());
+    }
+    std::fs::write(out, bytes).map_err(|e| e.to_string())
+}
+
 /// Speak once and return (used by the config app's "Preview voice").
 pub fn speak_once(cfg: &Config, text: &str) {
     nv_core::win::com_init();
     let shared = Shared::new();
     match Voice::load(cfg) {
-        Some(v) => v.speak(text, cfg, &shared),
+        Some(v) => {
+            let mut player = None;
+            v.speak(text, cfg, &shared, &mut player)
+        }
         None => log::warn!("preview: voice unavailable"),
     }
 }
@@ -141,6 +186,54 @@ pub fn speak_once(cfg: &Config, text: &str) {
 enum Voice {
     Neural { tts: OfflineTts, sid: i32 },
     System(nv_core::voice::Speaker),
+}
+
+/// [`ensure_player`] for a voice that is already in hand.
+fn ensure_player_from<'a>(
+    voice: &Voice,
+    cfg: &Config,
+    shared: &Arc<Shared>,
+    player: &'a mut Option<Player>,
+) -> Option<&'a mut Player> {
+    let Voice::Neural { tts, .. } = voice else { return None };
+    let rate = tts.sample_rate() as u32;
+    let stale = player.as_ref().is_none_or(|p| p.rate != rate || p.volume != cfg.voice_volume);
+    if stale {
+        match Player::start(rate, cfg.voice_volume, shared.clone()) {
+            Ok(p) => *player = Some(p),
+            Err(e) => {
+                log::error!("audio output: {e}");
+                return None;
+            }
+        }
+    }
+    player.as_mut()
+}
+
+/// Open the speakers for a neural voice, or hand back the one already open.
+///
+/// Created on the wake word rather than on the reply: the device — a Bluetooth
+/// headset here — takes a moment to wake, and doing that while the user is still
+/// speaking keeps the delay off the reply.
+fn ensure_player<'a>(
+    voice: &Option<Voice>,
+    cfg: &Config,
+    shared: &Arc<Shared>,
+    player: &'a mut Option<Player>,
+) -> Option<&'a mut Player> {
+    let Voice::Neural { tts, .. } = voice.as_ref()? else { return None };
+    let rate = tts.sample_rate() as u32;
+    let stale = player.as_ref().is_none_or(|p| p.rate != rate || p.volume != cfg.voice_volume);
+    if stale {
+        match Player::start(rate, cfg.voice_volume, shared.clone()) {
+            Ok(p) => *player = Some(p),
+            Err(e) => {
+                log::error!("audio output: {e}");
+                return None;
+            }
+        }
+    }
+    player.as_mut()
 }
 
 impl Voice {
@@ -170,20 +263,20 @@ impl Voice {
         v
     }
 
-    fn speak(&self, text: &str, cfg: &Config, shared: &Arc<Shared>) {
+    fn speak(&self, text: &str, cfg: &Config, shared: &Arc<Shared>, player: &mut Option<Player>) {
         match self {
             Voice::System(s) => s.say(text),
             Voice::Neural { tts, sid } => {
-                let player = match Player::start(tts.sample_rate() as u32, cfg.voice_volume, shared.clone()) {
-                    Ok(p) => p,
-                    Err(e) => {
-                        log::error!("audio output: {e}");
-                        return;
-                    }
-                };
+                let _ = tts;
+                // Kept open between replies: closing and reopening the stream is
+                // what lets the device fall asleep in the first place. The wake
+                // word normally opens it first, in time to wake a Bluetooth link.
+                let Some(player) = ensure_player_from(self, cfg, shared, player) else { return };
+                player.prime();
                 // Each sentence arrives through the callback as soon as it's
                 // synthesised, so playback starts before the whole reply is done.
                 let queue = player.feeder();
+                let sink = queue.clone();
                 let pushed = Arc::new(Mutex::new(false));
                 let pushed2 = pushed.clone();
                 let gen = GenerationConfig { sid: *sid, speed: cfg.voice_speed, ..Default::default() };
@@ -191,14 +284,14 @@ impl Voice {
                     text,
                     &gen,
                     Some(move |chunk: &[f32], _progress: f32| {
-                        queue.push(chunk);
+                        sink.push(chunk);
                         *pushed2.lock().unwrap() = true;
                         true
                     }),
                 );
                 if !*pushed.lock().unwrap() {
                     if let Some(a) = &audio {
-                        player.feeder().push(a.samples());
+                        queue.push(a.samples());
                     }
                 }
                 player.finish();
@@ -242,11 +335,21 @@ fn load_kokoro(name: &str, threads: u32) -> Option<(OfflineTts, i32)> {
     OfflineTts::create(&c).map(|t| (t, v.sid))
 }
 
+fn device_name(d: &cpal::Device) -> String {
+    d.description().map(|d| d.name().to_string()).unwrap_or_default()
+}
+
 /// Streams mono samples to the default speakers, resampling to the device
 /// rate, and feeds the bubble the playback loudness.
 struct Player {
     _stream: cpal::Stream,
     feeder: Feeder,
+    /// Sample rate the speech arrives at.
+    rate: u32,
+    volume: u8,
+    /// When it last had something to say, for deciding how much silence to
+    /// prime with.
+    last_used: Instant,
 }
 
 #[derive(Clone)]
@@ -336,20 +439,43 @@ impl Player {
             step: src_rate as f64 / rate as f64,
             state: Arc::new(Mutex::new((0.0, 0.0))),
         };
-        Ok(Player { _stream: stream, feeder })
+        log::info!("speakers: {} ({rate} Hz, {channels} ch, {format:?})", device_name(&device));
+        Ok(Player { _stream: stream, feeder, rate: src_rate, volume, last_used: Instant::now() })
     }
 
     fn feeder(&self) -> Feeder {
         self.feeder.clone()
     }
 
-    /// Block until everything queued has played.
-    fn finish(self) {
+    /// Silence in front of the speech.
+    ///
+    /// Monitor speakers, Bluetooth headsets and codecs that power down between
+    /// sounds all take a moment to wake, and the first thing they are asked to
+    /// play is the first phoneme of the reply — which is why "Reminder" arrives
+    /// as "minder". A little silence costs nothing and gives them that moment.
+    /// Wake the device properly: used when the wake word is heard, where the
+    /// silence happens while the user is still talking.
+    fn prime_hard(&mut self) {
+        let silence = vec![0.0f32; (self.rate as u64 * 400 / 1000) as usize];
+        self.feeder.push(&silence);
+        self.last_used = Instant::now();
+    }
+
+    fn prime(&mut self) {
+        let cold = self.last_used.elapsed() > Duration::from_secs(2);
+        let ms = if cold { 300 } else { 40 };
+        let silence = vec![0.0f32; (self.rate as u64 * ms / 1000) as usize];
+        self.feeder.push(&silence);
+    }
+
+    /// Block until everything queued has played, without closing the device.
+    fn finish(&mut self) {
         let deadline = Instant::now() + Duration::from_secs(60);
         while !self.feeder.queue.lock().unwrap().is_empty() && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(20));
         }
         // Let the device drain its own buffer.
         std::thread::sleep(Duration::from_millis(150));
+        self.last_used = Instant::now();
     }
 }

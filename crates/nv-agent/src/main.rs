@@ -110,6 +110,24 @@ fn main() {
         return;
     }
 
+    // `--tts-dump <out.wav> <text…>`: synthesise a line with the configured
+    // voice and write it out without playing it, so the spoken audio can be
+    // looked at (and transcribed back) on its own.
+    if args.iter().any(|a| a == "--tts-dump") {
+        let rest: Vec<&String> = args.iter().skip_while(|a| *a != "--tts-dump").skip(1).collect();
+        if let Some((out, words)) = rest.split_first() {
+            let text = words.iter().map(|w| w.as_str()).collect::<Vec<_>>().join(" ");
+            let cfg = nv_core::config::Config::load();
+            match tts::synthesize_to_wav(&cfg, &text, std::path::Path::new(out)) {
+                Ok(()) => println!("wrote {out}"),
+                Err(e) => eprintln!("{e}"),
+            }
+        } else {
+            eprintln!("usage: --tts-dump <out.wav> <text…>");
+        }
+        return;
+    }
+
     // `--chime`: play the wake-up chime once and exit. The settings app uses
     // this so you can hear exactly what waking sounds like.
     if args.iter().any(|a| a == "--chime") {
