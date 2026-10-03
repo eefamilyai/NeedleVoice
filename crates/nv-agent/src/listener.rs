@@ -76,6 +76,30 @@ impl Segment {
 
 pub fn run(cfg: Config, shared: Arc<Shared>, apps: Arc<RwLock<AppIndex>>, tts: Arc<Tts>, ctl: Receiver<Ctl>) {
     let models = nv_core::paths::models_dir();
+    // Everything slow — the model, the actions, the reply — runs on this thread.
+    // It used to run on the audio thread, where a single model call (measured at
+    // 20 seconds) stalled the microphone and threw the next utterance away.
+    // Lets a multi-step function speak as it goes, not only at the end.
+    let speaker = crate::tts::AgentVoice::new(tts.clone(), shared.clone());
+    let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<String>();
+    {
+        let cfg = cfg.clone();
+        let apps = apps.clone();
+        let shared = shared.clone();
+        let tts = tts.clone();
+        let speaker = speaker.clone();
+        let models = models.clone();
+        std::thread::Builder::new()
+            .name("commands".into())
+            .spawn(move || {
+                let mut brain = Brain::new(models.join(nv_core::NEEDLE_MODEL), cfg.needle_depth);
+                while let Ok(command) = cmd_rx.recv() {
+                    handle_command(&command, &cfg, &mut brain, &apps, &shared, &tts, speaker.as_ref());
+                    shared.set_mode(Mode::Hidden);
+                }
+            })
+            .expect("command thread");
+    }
     let mut stt: Option<Stt> = Some(Stt::new(&cfg));
     // Loading the recogniser takes a second or two, which is longer than the
     // sentence being spoken. It runs on its own thread so the model is ready by
@@ -105,7 +129,6 @@ pub fn run(cfg: Config, shared: Arc<Shared>, apps: Arc<RwLock<AppIndex>>, tts: A
     let mut phase = Phase::Idle;
     let mut level_smooth = 0.0f32;
     // Lets a multi-step function speak as it goes, not only at the end.
-    let speaker = crate::tts::AgentVoice::new(tts.clone(), shared.clone());
     let mut was_speaking = false;
     // Software boost from calibration, for quiet microphones.
     let gain = 10f32.powf(cfg.mic_gain_db / 20.0);
@@ -341,7 +364,8 @@ pub fn run(cfg: Config, shared: Arc<Shared>, apps: Arc<RwLock<AppIndex>>, tts: A
                                 if has_words(&hit.command) {
                                     shared.set_mode(Mode::Listening);
                                     tts.prepare();
-                                    phase = handle_command(&hit.command, &cfg, &mut brain, &apps, &shared, &tts, speaker.as_ref());
+                                    let _ = cmd_tx.send(hit.command.clone());
+                                    phase = Phase::Idle;
                                     drain(mic.as_ref());
                                 } else {
                                     shared.set_mode(Mode::Listening);
@@ -374,7 +398,8 @@ pub fn run(cfg: Config, shared: Arc<Shared>, apps: Arc<RwLock<AppIndex>>, tts: A
                             };
                             log::info!("heard: {text:?} -> command {command:?}");
                             if has_words(&command) {
-                                phase = handle_command(&command, &cfg, &mut brain, &apps, &shared, &tts, speaker.as_ref());
+                                let _ = cmd_tx.send(command.clone());
+                                phase = Phase::Idle;
                                 drain(mic.as_ref());
                             } else if has_wake {
                                 // Heard the name, understood nothing. Going quiet
