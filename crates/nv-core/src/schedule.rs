@@ -339,14 +339,8 @@ impl Item {
     pub fn describe(&self, now: Stamp) -> String {
         let when = match self.at {
             Some(at) => {
-                let repeat = match self.repeat {
-                    Repeat::Once => String::new(),
-                    Repeat::Daily => " (every day)".into(),
-                    Repeat::Weekdays => " (weekdays)".into(),
-                    Repeat::Weekly => format!(" (every {})", WEEKDAYS[at.weekday() as usize]),
-                    Repeat::Monthly => " (monthly)".into(),
-                    Repeat::Every(n) => format!(" (every {n} min)"),
-                };
+                let repeat = self.repeat_label();
+                let repeat = if repeat.is_empty() { repeat } else { format!(" {repeat}") };
                 format!("{} at {}{repeat}", at.speak_date(now), at.speak_time())
             }
             None => String::new(),
@@ -390,6 +384,10 @@ impl Item {
                 Some(if today > now { today } else { today.add_days(1) })
             }
             Repeat::Weekdays | Repeat::Weekly => {
+                // A weekly item repeats on the weekday of its *anchor*, which is
+                // not always the weekday of the day currently being tried: a
+                // reminder set for Monday must not come back as Tuesday just
+                // because Tuesday happens to follow today.
                 let want = (self.repeat == Repeat::Weekly).then(|| at.weekday());
                 let mut day = now;
                 for _ in 0..400 {
@@ -424,6 +422,33 @@ impl Item {
                 None => at.max(now),
                 Some(last) => last.add_minutes(n.max(1) as i64).max(now),
             }),
+        }
+    }
+
+    /// How the repeat reads in a list, alongside the kind and the wording.
+    pub fn repeat_label(&self) -> String {
+        match self.repeat {
+            Repeat::Once => String::new(),
+            Repeat::Daily => "(every day)".into(),
+            Repeat::Weekdays => "(weekdays)".into(),
+            Repeat::Weekly => match self.at {
+                Some(at) => format!("(every {})", WEEKDAYS[at.weekday() as usize]),
+                None => "(every week)".into(),
+            },
+            Repeat::Monthly => "(monthly)".into(),
+            Repeat::Every(n) => format!("(every {n} min)"),
+        }
+    }
+
+    /// "7:30 am tomorrow" — the way the time would be said, or nothing at all
+    /// for a to-do with no date. Derived from the item rather than the resolved
+    /// next occurrence, so a repeating item does not claim to be "today" when
+    /// it is not.
+    pub fn time_phrase(&self, now: Stamp) -> String {
+        match self.at {
+            Some(at) if self.kind == ItemKind::Todo => format!(" by {}", at.speak_date(now)),
+            Some(at) => format!(" {} at {}", at.speak_date(now), at.speak_time()),
+            None => String::new(),
         }
     }
 }
@@ -528,6 +553,14 @@ impl Schedule {
         self.pending().filter_map(|i| i.next_after(now).map(|t| (t, i))).min_by_key(|(t, _)| *t)
     }
 
+    /// The next `n` things coming up, soonest first.
+    pub fn soonest(&self, now: Stamp, n: usize) -> Vec<&Item> {
+        let mut timed: Vec<(Stamp, &Item)> =
+            self.pending().filter_map(|i| i.next_after(now).map(|t| (t, i))).collect();
+        timed.sort_by_key(|(t, _)| *t);
+        timed.into_iter().take(n).map(|(_, i)| i).collect()
+    }
+
     /// Items that should go off now, oldest first.
     pub fn due(&self, now: Stamp) -> Vec<&Item> {
         let mut out: Vec<&Item> = self.pending().filter(|i| i.due(now)).collect();
@@ -621,6 +654,17 @@ impl Schedule {
             None => {
                 let mut v: Vec<&Item> = self.agenda(now);
                 v.extend(self.todos(false));
+                // Asked late at night, everything timed has already rolled into
+                // tomorrow and today's agenda is empty — which used to be
+                // reported as "your schedule is clear" with a reminder sitting
+                // there due at 4 pm. Fill the list out with what is coming.
+                if v.len() < 6 {
+                    for item in self.soonest(now, 6) {
+                        if !v.iter().any(|seen| std::ptr::eq(*seen, item)) {
+                            v.push(item);
+                        }
+                    }
+                }
                 v
             }
         };
@@ -630,18 +674,8 @@ impl Schedule {
                 None => "Your schedule is clear.".into(),
             };
         }
-        let lines: Vec<String> = items
-            .iter()
-            .take(6)
-            .map(|item| {
-                let when = match item.at {
-                    Some(at) if item.kind == ItemKind::Todo => format!(" by {}", at.speak_date(now)),
-                    Some(at) => format!(" {} at {}", at.speak_date(now), at.speak_time()),
-                    None => String::new(),
-                };
-                format!("{}{when}: {}", item.kind.label(), item.text)
-            })
-            .collect();
+        let lines: Vec<String> =
+            items.iter().take(6).map(|item| format!("{}{}: {}", item.kind.label(), item.time_phrase(now), item.text)).collect();
         let more = items.len().saturating_sub(6);
         let tail = if more > 0 { format!(" And {more} more.") } else { String::new() };
         format!("{}.{tail}", lines.join(". "))
@@ -813,6 +847,27 @@ mod tests {
         assert_eq!(thirty_first.next_after(stamp(2026, 2, 1, 0, 0)).unwrap().date(), "2026-03-31");
     }
 
+    /// A weekly item repeats on the weekday it was anchored to, whichever day
+    /// the question is asked on. Asking on a Tuesday about a Monday reminder
+    /// used to answer "today at 09:00", which is both wrong and one day early.
+    #[test]
+    fn a_weekly_item_keeps_its_own_weekday() {
+        // Monday 2026-09-28 at 09:00, asked about on each later day that week.
+        let monday = item(ItemKind::Reminder, "standup", stamp(2026, 9, 28, 9, 0), Repeat::Weekly);
+        // Tuesday 29 September through Sunday 4 October, all of which must
+        // answer with the following Monday.
+        for (month, day) in [(9u8, 29u8), (9, 30), (10, 1), (10, 2), (10, 3), (10, 4)] {
+            let now = stamp(2026, month, day, 12, 0);
+            assert_eq!(monday.next_after(now).unwrap().date(), "2026-10-05", "asked on 2026-{month:02}-{day:02}");
+        }
+        // Late on the anchor day itself, the next one is a week away.
+        assert_eq!(monday.next_after(stamp(2026, 9, 28, 10, 0)).unwrap().date(), "2026-10-05");
+        // Before the time on the anchor day, it is still today.
+        assert_eq!(monday.next_after(stamp(2026, 9, 28, 8, 0)).unwrap().date(), "2026-09-28");
+        // And it is never "due" on the wrong weekday.
+        assert!(monday.due(stamp(2026, 9, 29, 9, 0)) == false, "a Monday reminder must not fire on Tuesday");
+    }
+
     #[test]
     fn every_n_minutes() {
         let start = stamp(2026, 10, 2, 8, 0);
@@ -880,6 +935,17 @@ mod tests {
         assert_eq!(s2.agenda(now).len(), 3);
         assert!(s2.spoken_summary(now, Some(ItemKind::Todo)).contains("buy milk"));
 
+        // Asked late at night, "today" is empty of everything timed and the
+        // answer used to be "your schedule is clear" with four things on it.
+        let late = stamp(2026, 10, 2, 23, 30);
+        let all = s2.spoken_summary(late, None);
+        assert!(all.contains("wake up"), "{all}");
+        assert!(all.contains("call the dentist"), "{all}");
+        assert!(all.contains("team lunch"), "{all}");
+        assert!(all.contains("buy milk"), "{all}");
+        assert!(!all.contains("clear"), "{all}");
+        // A quiet list really is clear, though.
+        assert_eq!(Schedule::default().spoken_summary(late, None), "Your schedule is clear.");
         // Marking a to-do done takes it out of the list.
         let mut s3 = s2.clone();
         s3.set_done(t, true);

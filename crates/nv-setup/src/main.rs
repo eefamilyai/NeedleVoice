@@ -97,15 +97,21 @@ fn stop_running() {
     std::thread::sleep(std::time::Duration::from_millis(400));
 }
 
-fn dir_size_kb(dir: &Path) -> u64 {
-    let mut total = 0;
-    if let Ok(rd) = std::fs::read_dir(dir) {
-        for e in rd.flatten() {
+/// Total size of a folder in bytes. The caller divides once, at the top: doing
+/// it per level multiplied every nested folder's total by 1024 again, so a
+/// single-level install reported its size as terabytes.
+fn dir_size_bytes(dir: &Path) -> u64 {
+    let Ok(rd) = std::fs::read_dir(dir) else { return 0 };
+    rd.flatten()
+        .map(|e| {
             let p = e.path();
-            total += if p.is_dir() { dir_size_kb(&p) * 1024 } else { e.metadata().map(|m| m.len()).unwrap_or(0) };
-        }
-    }
-    total / 1024
+            if p.is_dir() {
+                dir_size_bytes(&p)
+            } else {
+                e.metadata().map(|m| m.len()).unwrap_or(0)
+            }
+        })
+        .sum()
 }
 
 fn do_install(dir: &Path, name: &str, autostart: bool, desktop: bool, launch: bool, report: &dyn Fn(f32, &str)) -> Result<(), String> {
@@ -121,6 +127,11 @@ fn do_install(dir: &Path, name: &str, autostart: bool, desktop: bool, launch: bo
     }
     impl Read for Counting<'_> {
         fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            // Reading past the end is normal; the subtraction is the one that
+            // has to be guarded, or an empty payload underflows and panics.
+            if self.pos >= self.data.len() {
+                return Ok(0);
+            }
             let n = buf.len().min(self.data.len() - self.pos);
             buf[..n].copy_from_slice(&self.data[self.pos..self.pos + n]);
             self.pos += n;
@@ -133,8 +144,27 @@ fn do_install(dir: &Path, name: &str, autostart: bool, desktop: bool, launch: bo
     let reader = Counting { data: PAYLOAD, pos: 0, report };
     let dec = zstd::stream::Decoder::new(reader).map_err(|e| e.to_string())?;
     let mut archive = tar::Archive::new(dec);
-    archive.set_overwrite(true);
-    archive.unpack(dir).map_err(|e| format!("Couldn't copy files: {e}"))?;
+    // Unpacked file by file rather than with `unpack`: `unpack` follows whatever
+    // paths the archive holds, and a payload entry called `..\..\Windows\…`
+    // would be written there. Only relative names reach the disk here.
+    let entries = archive.entries().map_err(|e| format!("Couldn't read the payload: {e}"))?;
+    for entry in entries {
+        let mut entry = entry.map_err(|e| format!("Couldn't read the payload: {e}"))?;
+        let rel = entry.path().map_err(|e| e.to_string())?.into_owned();
+        if rel.is_absolute() || rel.components().any(|c| !matches!(c, std::path::Component::Normal(_))) {
+            return Err(format!("The installer payload contains an unsafe path: {}", rel.display()));
+        }
+        let to = dir.join(&rel);
+        if let Some(parent) = to.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| format!("Couldn't create {}: {e}", parent.display()))?;
+        }
+        if entry.header().entry_type().is_dir() {
+            std::fs::create_dir_all(&to).map_err(|e| format!("Couldn't create {}: {e}", to.display()))?;
+        } else if entry.header().entry_type().is_file() {
+            let mut out = std::fs::File::create(&to).map_err(|e| format!("Couldn't write {}: {e}", to.display()))?;
+            std::io::copy(&mut entry, &mut out).map_err(|e| format!("Couldn't write {}: {e}", to.display()))?;
+        }
+    }
 
     report(0.88, "Creating shortcuts…");
     let agent = dir.join(nv_core::AGENT_EXE);
@@ -161,7 +191,7 @@ fn do_install(dir: &Path, name: &str, autostart: bool, desktop: bool, launch: bo
     cfg.start_with_windows = autostart;
     cfg.save().map_err(|e| format!("Couldn't save settings: {e}"))?;
     win::set_autostart(autostart, &agent)?;
-    win::register_uninstaller(dir, env!("CARGO_PKG_VERSION"), dir_size_kb(dir) as u32)?;
+    win::register_uninstaller(dir, env!("CARGO_PKG_VERSION"), (dir_size_bytes(dir) / 1024).min(u32::MAX as u64) as u32)?;
 
     if launch {
         report(0.98, "Starting the assistant…");

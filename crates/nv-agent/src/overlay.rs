@@ -103,6 +103,7 @@ fn ov() -> Option<&'static mut Overlay> {
     unsafe { OVERLAY.as_deref_mut() }
 }
 
+#[allow(static_mut_refs)]
 pub fn create(shared: Arc<Shared>, enabled: bool, diameter: u32, margin: u32, accent: (f32, f32, f32)) -> windows::core::Result<HWND> {
     unsafe {
         let hinst = GetModuleHandleW(None)?;
@@ -124,6 +125,12 @@ pub fn create(shared: Arc<Shared>, enabled: bool, diameter: u32, margin: u32, ac
             None,
         )?;
         shared.hwnd.store(hwnd.0 as isize, Ordering::SeqCst);
+        // A second overlay would leak the first one's window, timer and GDI
+        // surface, and leave its timer firing into a replaced static.
+        if let Some(mut previous) = OVERLAY.take() {
+            previous.free_surface();
+            let _ = DestroyWindow(previous.hwnd);
+        }
         OVERLAY = Some(Box::new(Overlay {
             hwnd,
             shared,
@@ -274,9 +281,13 @@ impl Overlay {
 
     fn free_surface(&mut self) {
         unsafe {
+            // Only when the device context is real: the old code selected the
+            // bitmap into a null DC on the way to releasing one that failed.
             if !self.mem_dc.is_invalid() {
                 SelectObject(self.mem_dc, self.old);
-                let _ = DeleteObject(self.bmp.into());
+                if !self.bmp.is_invalid() {
+                    let _ = DeleteObject(self.bmp.into());
+                }
                 let _ = DeleteDC(self.mem_dc);
             }
         }
@@ -336,18 +347,18 @@ impl Overlay {
     }
 
     fn present(&mut self) {
-        let Some(pix) = self.pix.as_ref() else { return };
         if self.bits.is_null() {
             return;
         }
-        // tiny-skia is premultiplied RGBA; GDI wants premultiplied BGRA.
+        let Some(pix) = self.pix.as_ref() else { return };
+        // tiny-skia is premultiplied RGBA; GDI wants premultiplied BGRA. Chunked
+        // so each pixel arrives as one array with a single bounds check instead
+        // of four — this copies about a megabyte, sixty times a second, for as
+        // long as the bubble is on screen.
         let src = pix.data();
         let dst = unsafe { std::slice::from_raw_parts_mut(self.bits, src.len()) };
         for (d, s) in dst.chunks_exact_mut(4).zip(src.chunks_exact(4)) {
-            d[0] = s[2];
-            d[1] = s[1];
-            d[2] = s[0];
-            d[3] = s[3];
+            d.copy_from_slice(&[s[2], s[1], s[0], s[3]]);
         }
         unsafe {
             let size = SIZE { cx: self.px as i32, cy: self.px as i32 };

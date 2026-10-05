@@ -160,7 +160,9 @@ fn add_item(kind: ItemKind, text: &str, when: &str, chime: bool) -> Result<Strin
 
     let what = if text.is_empty() { "it".to_string() } else { format!("\"{text}\"") };
     if times_only {
-        let left = Schedule::open().todos(false).len();
+        // Counted from the copy already in hand: re-opening the file here read
+        // and re-parsed the whole schedule just to say how long the list is.
+        let left = schedule.todos(false).len();
         return Ok(match left {
             0 => format!("added {what} to your list"),
             1 => format!("added {what} to your list. That's the only thing on it"),
@@ -193,13 +195,17 @@ fn show_schedule(what: &str) -> Result<String, String> {
     let kind = asked_kind(what);
     let summary = schedule.spoken_summary(now, kind);
     // Say when the next thing is, too: it is the useful half of the answer.
-    if let Some((at, item)) = schedule.next_up(now) {
-        let extra = format!("Next up: {} at {}.", item.text, describe_when(at, item.repeat, now));
-        if summary.ends_with('.') {
-            return Ok(format!("{summary} {extra}"));
-        }
+    // The sentence has to be joined on whatever punctuation the summary ended
+    // with — "Your schedule is clear." and "…: buy milk" both happen — and the
+    // line is kept even when the summary is empty of a full stop, which is how
+    // this used to be computed and then silently thrown away.
+    let Some((at, item)) = schedule.next_up(now) else { return Ok(summary) };
+    let extra = format!("Next up: {} at {}", item.text, describe_when(at, item.repeat, now));
+    if summary.trim().is_empty() {
+        return Ok(format!("{extra}."));
     }
-    Ok(summary)
+    let sep = if summary.ends_with(['.', '!', '?']) { " " } else { ". " };
+    Ok(format!("{summary}{sep}{extra}."))
 }
 
 fn cancel_item(what: &str) -> Result<String, String> {
@@ -221,7 +227,11 @@ fn cancel_item(what: &str) -> Result<String, String> {
             format!("I couldn't find anything like \"{}\"", what.trim())
         });
     };
-    let removed = schedule.remove(id).unwrap();
+    // `find` and `remove` both look the id up; the second lookup can only fail
+    // if the schedule changed underneath, which is not worth a panic.
+    let Some(removed) = schedule.remove(id) else {
+        return Err("I couldn't tell which one you meant".to_string());
+    };
     schedule.save().map_err(|e| format!("couldn't save the schedule: {e}"))?;
     Ok(match removed.kind {
         ItemKind::Todo => format!("took \"{}\" off your list", removed.text),
@@ -557,9 +567,12 @@ fn close_app(name: &str, cfg: &Config, apps: &AppIndex) -> Result<String, String
         }
     }
     // Also match running process names directly: "close spotify" -> Spotify.exe.
+    // The squared spoken name and each process's stem are built once each,
+    // rather than squashing the exe name inside a loop that runs over every
+    // process on the machine.
     let spoken = fuzzy::squash(&fuzzy::strip_filler(name));
     for p in &procs {
-        let stem = fuzzy::squash(p.exe.trim_end_matches(".exe").trim_end_matches(".EXE"));
+        let stem = fuzzy::squash(without_exe_suffix(&p.exe));
         if !stem.is_empty() && (stem == spoken || strsim::jaro_winkler(&stem, &spoken) > 0.92) {
             exe_names.push(p.exe.clone());
         }
@@ -579,6 +592,16 @@ fn close_app(name: &str, cfg: &Config, apps: &AppIndex) -> Result<String, String
         return Err(format!("{display} has no windows to close"));
     }
     Ok(format!("closed {display}"))
+}
+
+/// A process name without its `.exe`, whatever case the extension is in.
+/// `trim_end_matches` cannot be used for this: it strips every matching
+/// character, not one occurrence, so "latex.exe" became "lat".
+fn without_exe_suffix(exe: &str) -> &str {
+    match exe.len().checked_sub(4) {
+        Some(at) if exe[at..].eq_ignore_ascii_case(".exe") => &exe[..at],
+        _ => exe,
+    }
 }
 
 fn to_url(site: &str) -> String {
@@ -681,7 +704,7 @@ mod tests {
 
     fn run(action: Action) -> Result<String, String> {
         let cfg = Config::default();
-        let apps = AppIndex { apps: Vec::new() };
+        let apps = AppIndex::from_names(Vec::new());
         execute(&action, &cfg, &apps)
     }
 
@@ -750,7 +773,7 @@ mod tests {
             ..Default::default()
         };
         cfg.custom_tools = vec![tool];
-        let apps = AppIndex { apps: Vec::new() };
+        let apps = AppIndex::from_names(Vec::new());
         let msg = execute_with(
             &Action::Custom { name: "sequence_test".into(), params: vec![("thing".into(), "the oven".into())] },
             &cfg,
@@ -790,7 +813,7 @@ mod tests {
             target: script.display().to_string(),
             ..Default::default()
         }];
-        let apps = AppIndex { apps: Vec::new() };
+        let apps = AppIndex::from_names(Vec::new());
         let out = execute(
             &Action::Custom { name: "python_test".into(), params: vec![("question".into(), "life".into())] },
             &cfg,
@@ -810,8 +833,30 @@ mod tests {
             target: "definitely-missing.py".into(),
             ..Default::default()
         }];
-        let apps = AppIndex { apps: Vec::new() };
+        let apps = AppIndex::from_names(Vec::new());
         let err = execute(&Action::Custom { name: "nope".into(), params: vec![] }, &cfg, &apps).unwrap_err();
         assert!(err.contains("definitely-missing.py"), "{err}");
+    }
+
+    /// Process names lose exactly their `.exe`, not every trailing "e"/"x".
+    #[test]
+    fn process_names_lose_one_suffix() {
+        assert_eq!(without_exe_suffix("Spotify.exe"), "Spotify");
+        assert_eq!(without_exe_suffix("SPOTIFY.EXE"), "SPOTIFY");
+        assert_eq!(without_exe_suffix("latex.exe"), "latex");
+        assert_eq!(without_exe_suffix("code.exe"), "code");
+        assert_eq!(without_exe_suffix("NeedleVoice"), "NeedleVoice");
+        assert_eq!(without_exe_suffix(".exe"), "");
+        assert_eq!(without_exe_suffix("exe"), "exe");
+    }
+
+    /// "open youtube" and "go to reddit.com" both have to end up at a URL the
+    /// browser can open, without turning a bare word into one.
+    #[test]
+    fn url_shapes() {
+        assert_eq!(to_url("reddit.com"), "https://reddit.com");
+        assert_eq!(to_url("https://example.com/x"), "https://example.com/x");
+        assert_eq!(to_url("www.example.com"), "https://example.com");
+        assert_eq!(to_url("YouTube"), "https://youtube.com");
     }
 }

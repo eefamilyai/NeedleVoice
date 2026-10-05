@@ -32,7 +32,7 @@ pub fn detect(transcript: &str, cfg: &Config) -> Option<WakeHit> {
     let split = split_words(transcript);
     cfg.wake_names()
         .iter()
-        .filter_map(|name| detect_name(&split, cfg, name))
+        .filter_map(|name| detect_name(&split, cfg, name, threshold(cfg)))
         .max_by(|a, b| a.score.partial_cmp(&b.score).unwrap_or(std::cmp::Ordering::Equal))
 }
 
@@ -56,14 +56,14 @@ fn split_words(transcript: &str) -> Split<'_> {
     Split { tokens, words, word_token }
 }
 
-fn detect_name(text: &Split<'_>, cfg: &Config, name: &str) -> Option<WakeHit> {
+fn detect_name(text: &Split<'_>, cfg: &Config, name: &str, min_score: f64) -> Option<WakeHit> {
     let Split { tokens, words, word_token } = text;
     if words.is_empty() {
         return None;
     }
     let target = fuzzy::squash(name);
     let (score, start, end) = fuzzy::find_name(words, name, 4)?;
-    let mut hit = score >= threshold(cfg);
+    let mut hit = score >= min_score;
 
     // "Hey Nova" sometimes arrives glued together as "Heynova".
     if !hit {
@@ -71,7 +71,7 @@ fn detect_name(text: &Split<'_>, cfg: &Config, name: &str) -> Option<WakeHit> {
             for p in &cfg.wake_prefixes {
                 let p = fuzzy::squash(p);
                 if let Some(rest) = w.strip_prefix(p.as_str()) {
-                    if !rest.is_empty() && strsim::jaro_winkler(rest, &target) >= threshold(cfg) {
+                    if !rest.is_empty() && strsim::jaro_winkler(rest, &target) >= min_score {
                         return Some(WakeHit { score: 1.0, command: rest_of(tokens, word_token, i + 1) });
                     }
                 }
@@ -101,12 +101,21 @@ pub fn name_score(transcript: &str, cfg: &Config) -> f64 {
 }
 
 /// Lowest sensitivity (0–1) at which this transcript would wake, if any.
+///
+/// The transcript is split once, then each name is scored once per candidate
+/// setting — 21 cheap threshold comparisons rather than 21 clones of the whole
+/// config, function list and all.
 pub fn sensitivity_needed(transcript: &str, cfg: &Config) -> Option<f32> {
-    (0..=20).map(|i| i as f32 / 20.0).find(|&s| {
-        let mut c = cfg.clone();
-        c.wake_sensitivity = s;
-        detect(transcript, &c).is_some()
-    })
+    let split = split_words(transcript);
+    let names = cfg.wake_names();
+    let settings = (0..=20).map(|i| i as f32 / 20.0);
+    for s in settings {
+        let min_score = 0.93 - 0.14 * s as f64;
+        if names.iter().any(|name| detect_name(&split, cfg, name, min_score).is_some()) {
+            return Some(s);
+        }
+    }
+    None
 }
 
 /// Original text from the token holding word `from` onwards.

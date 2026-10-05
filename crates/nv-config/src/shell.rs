@@ -221,17 +221,33 @@ impl App {
                                         .color(if self.agent_running { theme.text } else { theme.muted }),
                                 );
                             });
-                            ui.add_space(6.0);
-                            ui.horizontal(|ui| {
-                                let start = ui::ghost(ui, if self.agent_running { "Stop" } else { "Start assistant" });
-                                if start.clicked() {
-                                    if self.agent_running {
-                                        self.stop_agent();
-                                    } else {
-                                        self.start_agent();
-                                    }
+                            ui.add_space(8.0);
+                            // A button you can see without hunting for it, and
+                            // that says what is actually true of the assistant.
+                            let (label, enabled) = match (self.agent_running, self.starting_since) {
+                                (true, _) => ("Stop", true),
+                                (false, Some(_)) => ("Starting…", false),
+                                (false, None) => ("Start assistant", true),
+                            };
+                            let width = ui.available_width();
+                            let button = egui::Button::new(
+                                egui::RichText::new(label).size(13.0).strong().color(if enabled {
+                                    theme.text
+                                } else {
+                                    theme.muted
+                                }),
+                            )
+                            .fill(if self.agent_running { theme.inset } else { theme.accent_soft(60) })
+                            .stroke(egui::Stroke::new(1.0, if self.agent_running { theme.border_strong } else { theme.accent }))
+                            .corner_radius(egui::CornerRadius::same(9))
+                            .min_size(egui::vec2(width, 30.0));
+                            if ui.add_enabled(enabled, button).clicked() {
+                                if self.agent_running {
+                                    self.stop_agent();
+                                } else {
+                                    self.start_agent();
                                 }
-                            });
+                            }
                         });
                         });
                 });
@@ -286,6 +302,9 @@ impl App {
                         }
                         if ui::ghost(ui, "Revert").clicked() {
                             self.cfg = self.saved.clone();
+                            // The text boxes are rebuilt from the config, so the
+                            // half-typed values in them have to go with it.
+                            self.drafts.clear();
                             self.status = Some(("Put back the saved settings".into(), std::time::Instant::now(), true));
                         }
                     });

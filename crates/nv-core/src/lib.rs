@@ -31,6 +31,13 @@ pub const DEFAULT_WHISPER_MODEL: &str = "ggml-medium.en-q5_0.bin";
 /// speed; base is the more accurate of the two.
 pub const MOONSHINE_PACKS: [&str; 2] =
     ["sherpa-onnx-moonshine-base-en-int8", "sherpa-onnx-moonshine-tiny-en-int8"];
+/// SenseVoice: one model file, non-autoregressive, fast.
+pub const SENSEVOICE_PACK: &str = "sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2025-09-09";
+pub const SENSEVOICE_NANO_PACK: &str = "sherpa-onnx-sense-voice-funasr-nano-int8-2025-12-17";
+/// Dolphin: a small multilingual CTC model.
+pub const DOLPHIN_PACK: &str = "sherpa-onnx-dolphin-base-ctc-multi-lang-int8-2025-04-02";
+/// Moonshine v2, which supersedes v1 when it is present.
+pub const MOONSHINE_V2_PACK: &str = "sherpa-onnx-moonshine-base-en-quantized-2026-02-27";
 /// The pack the settings app downloads when none is installed.
 pub const MOONSHINE_PACK: &str = MOONSHINE_PACKS[0];
 /// Tarball the settings app downloads when it is missing.
@@ -56,6 +63,17 @@ pub fn pack_complete(dir: &std::path::Path) -> bool {
     ["preprocess.onnx", "encode.int8.onnx", "uncached_decode.int8.onnx", "cached_decode.int8.onnx", "tokens.txt"]
         .iter()
         .all(|f| dir.join(f).exists())
+}
+
+/// Where the v2 Moonshine pack lives.
+pub fn moonshine_v2_dir() -> std::path::PathBuf {
+    paths::models_dir().join("moonshine").join(MOONSHINE_V2_PACK)
+}
+
+/// Is Moonshine v2 on disk? It needs an encoder and a merged decoder.
+pub fn moonshine_v2_installed() -> bool {
+    let d = moonshine_v2_dir();
+    d.join("encoder_model.ort").exists() && d.join("decoder_model_merged.ort").exists() && d.join("tokens.txt").exists()
 }
 
 /// Is any Moonshine pack usable?

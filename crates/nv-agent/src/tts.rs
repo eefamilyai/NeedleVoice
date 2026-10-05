@@ -223,6 +223,10 @@ fn ensure_player<'a>(
 ) -> Option<&'a mut Player> {
     let Voice::Neural { tts, .. } = voice.as_ref()? else { return None };
     let rate = tts.sample_rate() as u32;
+    if player.as_ref().is_some_and(|p| !p.healthy()) {
+        log::warn!("rebuilding the audio output (the device stopped consuming it)");
+        *player = None;
+    }
     let stale = player.as_ref().is_none_or(|p| p.rate != rate || p.volume != cfg.voice_volume);
     if stale {
         match Player::start(rate, cfg.voice_volume, shared.clone()) {
@@ -376,6 +380,9 @@ struct Player {
     /// Until when the output keeps a whisper of signal going, so a link that
     /// suspends on silence is already awake when the reply starts.
     keep_alive: Arc<Mutex<Instant>>,
+    /// Cleared when the device stops consuming the stream, which is the one
+    /// failure that leaves a player that looks fine and plays nothing.
+    healthy: bool,
 }
 
 #[derive(Clone)]
@@ -387,6 +394,10 @@ struct Feeder {
     /// can be compared with what was heard.
     dump: Option<Arc<Mutex<Vec<f32>>>>,
     rate: u32,
+    /// Samples the device has actually taken. The only trustworthy evidence
+    /// that it is playing: a stream that was built, started and then never
+    /// calls back leaves the queue looking exactly like a busy one.
+    fed: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl Feeder {
@@ -426,18 +437,34 @@ impl Player {
         let keep_alive = Arc::new(Mutex::new(Instant::now()));
         let dump = std::env::var("NV_DUMP_TTS").ok().map(|_| Arc::new(Mutex::new(Vec::<f32>::new())));
         let dump_in_callback = dump.clone();
+        let fed = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let q = queue.clone();
         let awake_until = keep_alive.clone();
+        let fed_in_callback = fed.clone();
         let mut env = 0.0f32;
         // Only while a reply is on its way or just past: the rest of the time the
         // output is genuinely silent, because a constant whisper is worse than
         // the clipped syllable it was meant to prevent.
         let idle = dither(64 * 1024);
         let mut idle_at = idle.len();
+        // What was actually handed to the device this callback: the speech, the
+        // lead-in and the keep-alive. The dump used to record only the
+        // keep-alive samples, which made it a recording of the one thing it was
+        // never meant to be about.
+        let mut heard: Vec<f32> = Vec::new();
         let mut fill = move |out: &mut dyn FnMut(usize, f32), frames: usize| {
+            // Both of these are decided once per callback, not once per sample:
+            // a lock and a clock read inside a 480-frame loop is a lot of work
+            // for an answer that cannot change while the callback runs.
             let mut q = q.lock().unwrap();
             let whisper = Instant::now() < *awake_until.lock().unwrap();
+            let capture = dump_in_callback.is_some();
+            if capture {
+                heard.clear();
+                heard.reserve(frames);
+            }
             let mut sum = 0.0;
+            let mut taken = 0u64;
             for i in 0..frames {
                 let s = match q.pop_front() {
                     Some(v) => v * gain,
@@ -446,18 +473,22 @@ impl Player {
                             idle_at = 0;
                         }
                         idle_at += 1;
-                        let v = idle[idle_at - 1];
-                        if let Some(dump) = &dump_in_callback {
-                            dump.lock().unwrap().push(v);
-                        }
-                        v
+                        idle[idle_at - 1]
                     }
                     None => 0.0,
                 };
+                if capture {
+                    heard.push(s);
+                }
                 sum += s * s;
+                taken += 1;
                 for c in 0..channels {
                     out(i * channels + c, s);
                 }
+            }
+            fed_in_callback.fetch_add(taken, std::sync::atomic::Ordering::Relaxed);
+            if let Some(dump) = &dump_in_callback {
+                dump.lock().unwrap().extend_from_slice(&heard);
             }
             let rms = (sum / frames.max(1) as f32).sqrt();
             env = env * 0.7 + (rms * 4.0).min(1.0) * 0.3;
@@ -497,9 +528,18 @@ impl Player {
             state: Arc::new(Mutex::new((0.0, 0.0))),
             dump,
             rate,
+            fed,
         };
         log::info!("speakers: {} ({rate} Hz, {channels} ch, {format:?})", device_name(&device));
-        Ok(Player { _stream: stream, feeder, rate: src_rate, volume, last_used: Instant::now(), keep_alive })
+        Ok(Player {
+            _stream: stream,
+            feeder,
+            rate: src_rate,
+            volume,
+            last_used: Instant::now(),
+            keep_alive,
+            healthy: true,
+        })
     }
 
     fn feeder(&self) -> Feeder {
@@ -554,10 +594,75 @@ impl Player {
     }
 
     /// Block until everything queued has played, without closing the device.
+    ///
+    /// A device that has stopped consuming the stream — the log has shown
+    /// "The stream configuration is no longer valid and must be rebuilt" after a
+    /// Bluetooth headset changed format — leaves the queue full for ever, so the
+    /// wait is now bounded well short of the old minute and failing it marks the
+    /// player for rebuilding. Otherwise every reply after that one would sit
+    /// silently in the queue, with the microphone closed because the agent still
+    /// believed it was talking.
     fn finish(&mut self) {
-        let deadline = Instant::now() + Duration::from_secs(60);
-        while !self.feeder.queue.lock().unwrap().is_empty() && Instant::now() < deadline {
+        use std::sync::atomic::Ordering;
+        // How long the queued audio should take, plus a second for the device's
+        // own buffering, and never more: a device that has stopped playing must
+        // not hold the speaking thread — and with it the microphone — for the
+        // full timeout on every reply.
+        let started = Instant::now();
+        let queued = self.feeder.queue.lock().unwrap().len() as u64;
+        let expect = Duration::from_secs_f32(queued as f32 / self.feeder.rate as f32) + Duration::from_secs(2);
+        let deadline = started + expect.min(Duration::from_secs(30));
+        let mut last = self.feeder.fed.load(Ordering::Relaxed);
+        let mut stalled_since = Instant::now();
+        loop {
+            if self.feeder.queue.lock().unwrap().is_empty() {
+                break;
+            }
+            if Instant::now() >= deadline {
+                break;
+            }
             std::thread::sleep(Duration::from_millis(20));
+            let now = self.feeder.fed.load(Ordering::Relaxed);
+            if now != last {
+                last = now;
+                stalled_since = Instant::now();
+            } else if stalled_since.elapsed() > Duration::from_secs(3) {
+                // Three seconds without the device taking a single sample: it is
+                // not going to.
+                break;
+            }
+        }
+        // Whatever is left after that never played. Two samples of residue are
+        // normal — the device stops asking once it has enough silence buffered
+        // — so only a real backlog counts as failure.
+        let left = {
+            let mut queue = self.feeder.queue.lock().unwrap();
+            let left = queue.len();
+            if left > 1024 {
+                queue.clear();
+            }
+            left
+        };
+        if left > 1024 {
+            self.healthy = false;
+            let played = self.feeder.fed.load(Ordering::Relaxed);
+            if played == 0 {
+                log::error!(
+                    "the audio output never played anything ({queued} samples queued, {left} still waiting) — \
+                     the device accepted the stream and then stopped calling back; reopening it"
+                );
+            } else {
+                log::warn!(
+                    "the audio output stopped part-way through a reply ({} of {queued} samples played) — reopening it",
+                    played.min(queued)
+                );
+            }
+        } else {
+            log::debug!(
+                "playback: {} of {queued} samples in {:?}, {left} left queued",
+                self.feeder.fed.load(Ordering::Relaxed),
+                started.elapsed()
+            );
         }
         // Let the device drain its own buffer.
         std::thread::sleep(Duration::from_millis(150));
@@ -566,6 +671,11 @@ impl Player {
         // and its tail, not for the rest of the session.
         self.wake_for(Duration::from_secs(2));
         self.last_used = Instant::now();
+    }
+
+    /// False once the device has been seen to stop consuming the stream.
+    fn healthy(&self) -> bool {
+        self.healthy
     }
 }
 

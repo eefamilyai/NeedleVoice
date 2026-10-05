@@ -649,10 +649,22 @@ pub fn screenshot() -> Result<PathBuf, String> {
             return Err("couldn't measure the screen".into());
         }
         let screen = GetDC(None);
+        if screen.is_invalid() {
+            return Err("couldn't get the screen".into());
+        }
+        // Every GDI object is checked as it is made: creating a device context
+        // or a bitmap can fail under memory pressure, and the old code carried
+        // on regardless and blitted into a null surface.
         let mem = CreateCompatibleDC(Some(screen));
-        let bitmap = CreateCompatibleBitmap(screen, w, h);
+        let bitmap = if mem.is_invalid() { Default::default() } else { CreateCompatibleBitmap(screen, w, h) };
+        if mem.is_invalid() || bitmap.is_invalid() {
+            if !mem.is_invalid() {
+                let _ = DeleteDC(mem);
+            }
+            ReleaseDC(None, screen);
+            return Err("couldn't create the capture surface".into());
+        }
         let old = SelectObject(mem, bitmap.into());
-        let blit = BitBlt(mem, 0, 0, w, h, Some(screen), x, y, SRCCOPY);
         let mut pixels = vec![0u8; (w as usize) * (h as usize) * 4];
         let mut info = BITMAPINFO {
             bmiHeader: BITMAPINFOHEADER {
@@ -666,9 +678,16 @@ pub fn screenshot() -> Result<PathBuf, String> {
             },
             ..Default::default()
         };
-        let lines = GetDIBits(mem, bitmap, 0, h as u32, Some(pixels.as_mut_ptr().cast()), &mut info, DIB_RGB_COLORS);
-        // Release GDI objects before doing anything that can fail.
+        let blit = BitBlt(mem, 0, 0, w, h, Some(screen), x, y, SRCCOPY);
+        // `GetDIBits` refuses to read a bitmap that is still selected into a
+        // device context, so it has to come out first — which is also the only
+        // order in which the copy can be trusted to have happened.
         SelectObject(mem, old);
+        let lines = if blit.is_ok() {
+            GetDIBits(mem, bitmap, 0, h as u32, Some(pixels.as_mut_ptr().cast()), &mut info, DIB_RGB_COLORS)
+        } else {
+            0
+        };
         let _ = DeleteObject(bitmap.into());
         let _ = DeleteDC(mem);
         ReleaseDC(None, screen);
@@ -677,9 +696,11 @@ pub fn screenshot() -> Result<PathBuf, String> {
         if lines == 0 {
             return Err("couldn't read the screen pixels".into());
         }
-        // GDI hands back BGRA.
+        // GDI hands back BGRA with the alpha byte left at zero, which as RGBA
+        // would be a fully transparent PNG.
         for px in pixels.chunks_exact_mut(4) {
             px.swap(0, 2);
+            px[3] = 255;
         }
         let path = screenshot_path();
         if let Some(dir) = path.parent() {
@@ -760,10 +781,11 @@ pub fn run_capture_command(
     let err = collect(child.stderr.take().map(|s| Box::new(s) as Box<dyn Read + Send>));
 
     let deadline = std::time::Instant::now() + timeout;
+    let started = std::time::Instant::now();
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break Some(status),
-            Ok(None) if std::time::Instant::now() < deadline => std::thread::sleep(std::time::Duration::from_millis(25)),
+            Ok(None) if std::time::Instant::now() < deadline => std::thread::sleep(poll_gap(started.elapsed())),
             Ok(None) => {
                 let _ = child.kill();
                 let _ = child.wait();
@@ -786,6 +808,26 @@ pub fn run_capture_command(
     }
 }
 
+/// How long to wait before asking again whether a child has finished.
+///
+/// A Python or PowerShell function is short, and a flat 25 ms poll spent most
+/// of its time asleep: a script that took 60 ms was reported as 100. The gap
+/// starts short enough to notice an immediate exit and lengthens so a long
+/// script still costs almost nothing.
+fn poll_gap(elapsed: std::time::Duration) -> std::time::Duration {
+    let ms = elapsed.as_millis();
+    let gap = if ms < 50 {
+        2
+    } else if ms < 250 {
+        5
+    } else if ms < 1000 {
+        10
+    } else {
+        25
+    };
+    std::time::Duration::from_millis(gap)
+}
+
 /// Stop a running process by image name. The agent has no IPC, so this is how
 /// the settings app's Stop button and the tray's Exit both end it.
 pub fn stop_process(image: &str) -> bool {
@@ -803,23 +845,19 @@ pub fn find_python(configured: &str) -> Option<PathBuf> {
         let p = PathBuf::from(configured);
         return p.exists().then_some(p);
     }
-    let usable = |p: &PathBuf| -> bool {
+    let usable = |p: &Path| -> bool {
         let Ok(meta) = std::fs::metadata(p) else { return false };
         // Store aliases are 0-byte reparse points.
-        meta.len() > 0 && !p.to_string_lossy().contains("\\WindowsApps\\")
+        meta.len() > 0 && !p.to_string_lossy().to_ascii_lowercase().contains("\\windowsapps\\")
     };
-    if let Some(path) = std::env::var_os("PATH") {
-        let dirs: Vec<PathBuf> = std::env::split_paths(&path).collect();
-        for name in ["py.exe", "python3.exe", "python.exe"] {
-            for dir in &dirs {
-                let candidate = dir.join(name);
-                if usable(&candidate) {
-                    return Some(candidate);
-                }
-            }
-        }
-    }
-    // Then the usual per-user and machine-wide installs, newest first.
+    let named = |dir: &Path| -> Option<PathBuf> {
+        ["py.exe", "python.exe"].iter().map(|n| dir.join(n)).find(|p| usable(p))
+    };
+
+    // The real installs first: a handful of directory reads, against walking
+    // every entry on PATH. The settings app asks for this on every frame, and
+    // walking PATH twice a frame on a machine without Python is what made the
+    // window stutter.
     let mut roots: Vec<PathBuf> = Vec::new();
     for var in ["LOCALAPPDATA", "ProgramFiles", "ProgramFiles(x86)"] {
         if let Some(root) = std::env::var_os(var) {
@@ -829,17 +867,38 @@ pub fn find_python(configured: &str) -> Option<PathBuf> {
         }
     }
     let mut installs: Vec<PathBuf> = Vec::new();
-    for root in roots {
-        let Ok(entries) = std::fs::read_dir(&root) else { continue };
+    for root in &roots {
+        let Ok(entries) = std::fs::read_dir(root) else { continue };
         for entry in entries.flatten() {
-            let candidate = entry.path().join("python.exe");
-            if usable(&candidate) {
-                installs.push(candidate);
+            if let Some(found) = named(&entry.path()) {
+                installs.push(found);
+            }
+        }
+        // A bare `Python\py.exe`, with no version folder in between.
+        if let Some(found) = named(root) {
+            installs.push(found);
+        }
+    }
+    // Newest first by path, which is how these sort: Python313 > Python312.
+    installs.sort();
+    if let Some(found) = installs.pop() {
+        return Some(found);
+    }
+
+    // Then whatever PATH points at. `python3.exe` comes last: on Windows the
+    // only thing that name usually resolves to is the Store alias.
+    if let Some(path) = std::env::var_os("PATH") {
+        let dirs: Vec<PathBuf> = std::env::split_paths(&path).collect();
+        for name in ["py.exe", "python.exe", "python3.exe"] {
+            for dir in &dirs {
+                let candidate = dir.join(name);
+                if usable(&candidate) {
+                    return Some(candidate);
+                }
             }
         }
     }
-    installs.sort();
-    installs.pop()
+    None
 }
 
 // ── Clock ────────────────────────────────────────────────────────────────
@@ -894,6 +953,22 @@ mod tests {
         assert!(press_keys("ctrl+nonsense").is_err());
     }
 
+    /// The poll gap only ever grows, and starts short enough to notice a
+    /// process that exits at once.
+    #[test]
+    fn child_polling_starts_quick_and_backs_off() {
+        use std::time::Duration;
+        assert!(poll_gap(Duration::ZERO) <= Duration::from_millis(2));
+        let mut last = Duration::ZERO;
+        for ms in [0u64, 10, 60, 300, 2_000, 30_000] {
+            let gap = poll_gap(Duration::from_millis(ms));
+            assert!(gap >= last, "{ms} ms went backwards");
+            assert!(gap <= Duration::from_millis(25), "{ms} ms polled slower than the old flat 25");
+            last = gap;
+        }
+        assert_eq!(poll_gap(Duration::from_secs(60)), Duration::from_millis(25));
+    }
+
     #[test]
     fn media_keys_are_mapped() {
         use crate::brain::MediaKey::*;
@@ -924,7 +999,10 @@ mod tests {
         println!("master volume {before}% (unchanged)");
     }
 
-    /// Captures the screen, then reads the PNG back to prove it is a real image.
+    /// Captures the screen, then reads the PNG back to prove it is a real image:
+    /// the right size (which catches a capture surface that never got created),
+    /// fully opaque (which catches the alpha byte GDI leaves at zero) and not
+    /// one flat colour (which catches a blit that did not happen).
     #[test]
     #[ignore]
     fn screenshot_is_a_png() {
@@ -934,11 +1012,24 @@ mod tests {
         let mut reader = decoder.read_info().unwrap();
         let info = reader.info();
         let (w, h) = (info.width, info.height);
+        assert_eq!(info.color_type, png::ColorType::Rgba, "a screenshot must be RGBA");
         let expected = unsafe { (GetSystemMetrics(SM_CXVIRTUALSCREEN), GetSystemMetrics(SM_CYVIRTUALSCREEN)) };
         assert_eq!((w, h), (expected.0 as u32, expected.1 as u32), "size mismatch");
         let mut buf = vec![0; reader.output_buffer_size().unwrap()];
         reader.next_frame(&mut buf).unwrap();
-        println!("{}: {w}x{h}, {} bytes", path.display(), bytes.len());
+
+        let mut opaque = 0usize;
+        let mut colours = std::collections::HashSet::new();
+        for px in buf.chunks_exact(4).step_by(4096) {
+            if px[3] == 255 {
+                opaque += 1;
+            }
+            colours.insert([px[0], px[1], px[2]]);
+        }
+        let sampled = buf.len() / 4 / 4096 + 1;
+        assert_eq!(opaque, sampled, "the capture came back transparent");
+        assert!(colours.len() > 1, "the capture is a single flat colour — the blit did nothing");
+        println!("{}: {w}x{h}, {} bytes, {} distinct colours", path.display(), bytes.len(), colours.len());
         let _ = std::fs::remove_file(&path);
     }
 

@@ -40,7 +40,16 @@ pub fn default_install_dir() -> PathBuf {
 
 /// Where model files live. Prefers `<exe dir>\models`; during development
 /// also walks up from the exe looking for a `models` folder.
+///
+/// Resolved once and remembered: the answer cannot change while the process
+/// runs, and the settings app asks for it from several pages on every frame,
+/// each time walking the directory tree and probing the disk.
 pub fn models_dir() -> PathBuf {
+    static DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    DIR.get_or_init(resolve_models_dir).clone()
+}
+
+fn resolve_models_dir() -> PathBuf {
     let mut dir = Some(exe_dir());
     while let Some(d) = dir {
         let candidate = d.join("models");

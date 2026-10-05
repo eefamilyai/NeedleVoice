@@ -20,7 +20,7 @@ use crate::bubble::Mode;
 use crate::tts::Tts;
 use nv_core::personality::{self, Moment, Outcome};
 use crate::overlay::Shared;
-use crate::stt::Stt;
+use crate::stt::{Backend, Stt};
 
 const FRAME: usize = 480; // 30 ms at 16 kHz
 const FRAME_MS: u32 = 30;
@@ -81,7 +81,7 @@ pub fn run(cfg: Config, shared: Arc<Shared>, apps: Arc<RwLock<AppIndex>>, tts: A
     // 20 seconds) stalled the microphone and threw the next utterance away.
     // Lets a multi-step function speak as it goes, not only at the end.
     let speaker = crate::tts::AgentVoice::new(tts.clone(), shared.clone());
-    let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<String>();
+    let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<(String, Vec<f32>)>();
     {
         let cfg = cfg.clone();
         let apps = apps.clone();
@@ -93,8 +93,28 @@ pub fn run(cfg: Config, shared: Arc<Shared>, apps: Arc<RwLock<AppIndex>>, tts: A
             .name("commands".into())
             .spawn(move || {
                 let mut brain = Brain::new(models.join(nv_core::NEEDLE_MODEL), cfg.needle_depth);
-                while let Ok(command) = cmd_rx.recv() {
-                    handle_command(&command, &cfg, &mut brain, &apps, &shared, &tts, speaker.as_ref());
+                // The second opinion. Only loaded if it is ever needed, and only
+                // used when the fast engine's transcript leads nowhere — which is
+                // where accuracy is worth seconds.
+                let mut careful: Option<Stt> = None;
+                while let Ok((mut command, audio)) = cmd_rx.recv() {
+                    let outcome =
+                        handle_command(&command, &cfg, &mut brain, &apps, &shared, &tts, speaker.as_ref());
+                    if !outcome && audio.len() > crate::audio::RATE as usize / 3 {
+                        if careful.is_none() {
+                            careful = Some(Stt::with(Backend::Whisper, cfg.threads, &cfg.agent_name, &cfg.whisper_model));
+                        }
+                        if let Some(second) = careful.as_mut() {
+                            if let Ok(better) = second.transcribe(&audio) {
+                                if !better.is_empty() && better != command {
+                                    log::info!("second opinion: {better:?} (was {command:?})");
+                                    command = better;
+                                    tts.prepare();
+                                    handle_command(&command, &cfg, &mut brain, &apps, &shared, &tts, speaker.as_ref());
+                                }
+                            }
+                        }
+                    }
                     shared.set_mode(Mode::Hidden);
                 }
             })
@@ -125,6 +145,9 @@ pub fn run(cfg: Config, shared: Arc<Shared>, apps: Arc<RwLock<AppIndex>>, tts: A
 
     let mut pending: Vec<f32> = Vec::with_capacity(FRAME * 4);
     let mut preroll: VecDeque<[f32; FRAME]> = VecDeque::with_capacity(PREROLL_FRAMES + 1);
+    // Scratch for the VAD, which only takes 16-bit samples: one buffer for the
+    // whole loop rather than an allocation every 30 ms.
+    let mut pcm = [0i16; FRAME];
     let mut seg: Option<Segment> = None;
     let mut phase = Phase::Idle;
     let mut level_smooth = 0.0f32;
@@ -154,6 +177,12 @@ pub fn run(cfg: Config, shared: Arc<Shared>, apps: Arc<RwLock<AppIndex>>, tts: A
     let mut spotter_quiet_ms = 0u32;
     // Ignore the mic briefly after waking so the chime isn't taken as speech.
     let mut deaf_frames: u32 = 0;
+    // (peak seen, when it was last heard) — for the silence warning below.
+    let mut silence_watch: Option<(f32, Instant)> = Some((0.0, Instant::now()));
+    let mut silence_reported = false;
+    let mut meter_peak = 0.0f32;
+    let mut meter_until = Some(Instant::now() + Duration::from_secs(30));
+    let mut meter_at = Instant::now();
     // Set when the pre-roll holds our own voice, so only its tail is used.
     let mut after_reply = false;
 
@@ -204,10 +233,14 @@ pub fn run(cfg: Config, shared: Arc<Shared>, apps: Arc<RwLock<AppIndex>>, tts: A
             }
             last_open_try = Instant::now();
             mic = None;
-            match Mic::open(&cfg.microphone) {
+            match Mic::open(&cfg.microphone, cfg.avoid_bluetooth_mic) {
                 Ok(m) => {
                     mic = Some(m);
                     last_audio = Instant::now();
+                    // Meter afresh whenever the device is (re)opened.
+                    meter_until = Some(Instant::now() + Duration::from_secs(30));
+                    meter_at = Instant::now();
+                    meter_peak = 0.0;
                 }
                 Err(e) => {
                     log::warn!("microphone unavailable: {e}");
@@ -218,7 +251,40 @@ pub fn run(cfg: Config, shared: Arc<Shared>, apps: Arc<RwLock<AppIndex>>, tts: A
 
         // Wake periodically even without audio so timeouts fire.
         let chunk = match mic.as_ref().unwrap().rx.recv_timeout(Duration::from_millis(100)) {
-            Ok(c) => c,
+            Ok(c) => {
+                let peak = c.iter().fold(0f32, |m, s| m.max(s.abs()));
+                if peak > 0.003 {
+                    silence_watch = Some((peak, Instant::now()));
+                    meter_peak = meter_peak.max(peak);
+                    if silence_reported {
+                        log::info!("microphone is hearing something again");
+                        silence_reported = false;
+                    }
+                } else if let Some((_, since)) = silence_watch {
+                    if since.elapsed() > Duration::from_secs(20) && !silence_reported {
+                        let device = if cfg.microphone.is_empty() { "the default microphone" } else { &cfg.microphone };
+                        log::warn!(
+                            "\"{device}\" has heard nothing above -50 dBFS for 20 seconds (loudest was \
+                             {:.0} dBFS) — check it is the right device, that it is not muted, and the \
+                             Windows input level",
+                            20.0 * meter_peak.max(1e-9).log10()
+                        );
+                        silence_reported = true;
+                    }
+                }
+                // For the first half-minute, report the level every five seconds:
+                // "can it hear me" is the first question when nothing responds.
+                if meter_until.is_some_and(|t| Instant::now() < t) && meter_at.elapsed() > Duration::from_secs(5) {
+                    meter_at = Instant::now();
+                    let db = 20.0 * peak.max(meter_peak).max(1e-9).log10();
+                    log::info!(
+                        "microphone level: {db:.0} dBFS peak{}",
+                        if db < -55.0 { " — it is not hearing you" } else { " — it can hear you" }
+                    );
+                    meter_peak = 0.0;
+                }
+                c
+            }
             Err(RecvTimeoutError::Timeout) => {
                 check_timeout(&mut phase, &shared);
                 continue;
@@ -271,7 +337,11 @@ pub fn run(cfg: Config, shared: Arc<Shared>, apps: Arc<RwLock<AppIndex>>, tts: A
 
             let rms = (frame.iter().map(|s| s * s).sum::<f32>() / FRAME as f32).sqrt();
             let db = 20.0 * rms.max(1e-9).log10();
-            let pcm: Vec<i16> = frame.iter().map(|s| (s.clamp(-1.0, 1.0) * 32767.0) as i16).collect();
+            // One scratch buffer for the whole loop: the VAD wants i16 and a
+            // fresh Vec here was an allocation every 30 ms, for ever.
+            for (dst, src) in pcm.iter_mut().zip(frame.iter()) {
+                *dst = (src.clamp(-1.0, 1.0) * 32767.0) as i16;
+            }
             let speech = db > cfg.min_speech_db && vad.is_voice_segment(&pcm).unwrap_or(false);
 
             // Mic level for the orb: -60 dB → 0, -15 dB → 1.
@@ -294,13 +364,21 @@ pub fn run(cfg: Config, shared: Arc<Shared>, apps: Arc<RwLock<AppIndex>>, tts: A
                             if s.loaded() {
                                 stt = Some(s);
                             } else {
-                                loading = std::thread::Builder::new()
+                                // A thread that cannot be created would take the
+                                // recogniser with it, and every command would
+                                // transcribe to nothing; load it here instead.
+                                match std::thread::Builder::new()
                                     .name("stt-load".into())
                                     .spawn(move || {
                                         s.prepare();
                                         s
                                     })
-                                    .ok();
+                                {
+                                    Ok(handle) => loading = Some(handle),
+                                    Err(e) => {
+                                        log::warn!("couldn't start the recognition thread ({e}); loading inline");
+                                    }
+                                }
                             }
                         }
                     }
@@ -364,7 +442,7 @@ pub fn run(cfg: Config, shared: Arc<Shared>, apps: Arc<RwLock<AppIndex>>, tts: A
                                 if has_words(&hit.command) {
                                     shared.set_mode(Mode::Listening);
                                     tts.prepare();
-                                    let _ = cmd_tx.send(hit.command.clone());
+                                    let _ = cmd_tx.send((hit.command.clone(), s.audio.clone()));
                                     phase = Phase::Idle;
                                     drain(mic.as_ref());
                                 } else {
@@ -398,7 +476,7 @@ pub fn run(cfg: Config, shared: Arc<Shared>, apps: Arc<RwLock<AppIndex>>, tts: A
                             };
                             log::info!("heard: {text:?} -> command {command:?}");
                             if has_words(&command) {
-                                let _ = cmd_tx.send(command.clone());
+                                let _ = cmd_tx.send((command.clone(), s.audio.clone()));
                                 phase = Phase::Idle;
                                 drain(mic.as_ref());
                             } else if has_wake {
@@ -579,7 +657,7 @@ fn handle_command(
     shared: &Shared,
     tts: &Tts,
     speaker: &crate::tts::AgentVoice,
-) -> Phase {
+) -> bool {
     shared.set_mode(Mode::Thinking);
     let index = apps.read().unwrap().clone();
     let decision = brain.decide(command, cfg, &index);
@@ -621,7 +699,9 @@ fn handle_command(
     }
     tts.say(&reply);
     shared.set_mode(if failed { Mode::Error } else { Mode::Success });
-    Phase::Idle
+    // "Understood" means it actually did something: an empty batch is the
+    // "I didn't catch that" case, which is where a second opinion is worth it.
+    !decision.actions.is_empty()
 }
 
 /// Throw away audio captured while we were busy thinking.

@@ -39,6 +39,22 @@ pub fn spawn_app_scan(cfg: Config, apps: Arc<RwLock<AppIndex>>) {
         .ok();
 }
 
+/// The samples of a 16 kHz mono 16-bit WAV, found by the `data` chunk rather
+/// than assumed to start at byte 44 — plenty of writers put a `LIST` or `fact`
+/// chunk in front of it, and the audio would then be read one chunk-header's
+/// worth of bytes out of step.
+pub(crate) fn nv_agent_wav(bytes: &[u8]) -> Vec<f32> {
+    let start = bytes
+        .windows(4)
+        .position(|w| w == b"data")
+        .map(|p| (p + 8).min(bytes.len()))
+        .unwrap_or_else(|| 44.min(bytes.len()));
+    bytes[start..]
+        .chunks_exact(2)
+        .map(|b| i16::from_le_bytes([b[0], b[1]]) as f32 / 32768.0)
+        .collect()
+}
+
 fn main() {
     logger::init();
     let args: Vec<String> = std::env::args().collect();
@@ -53,13 +69,9 @@ fn main() {
         let cfg = Config::load();
         let text = match std::fs::read(&input) {
             Ok(bytes) => {
-                let pos = bytes.windows(4).position(|w| w == b"data").map(|p| p + 8).unwrap_or(44);
-                let audio: Vec<f32> = bytes[pos.min(bytes.len())..]
-                    .chunks_exact(2)
-                    .map(|b| i16::from_le_bytes([b[0], b[1]]) as f32 / 32768.0)
-                    .collect();
+                let audio = nv_agent_wav(&bytes);
                 let mut stt = stt::Stt::new(&cfg);
-                log::info!("transcribing with {}", stt.engine().label());
+                log::info!("transcribing with {}", stt.engine());
                 stt.transcribe(&audio).unwrap_or_else(|e| format!("ERROR: {e}"))
             }
             Err(e) => format!("ERROR: {e}"),
@@ -78,21 +90,22 @@ fn main() {
             return;
         };
         let cfg = nv_core::config::Config::load();
-        let mut stt = if model.as_str() == "moonshine" {
-            stt::Stt::moonshine(cfg.threads)
-        } else {
-            stt::Stt::whisper(nv_core::paths::models_dir().join(model.as_str()), cfg.threads, &cfg.agent_name)
+        let mut stt = match stt::Backend::parse(model) {
+            Some(backend) => stt::Stt::with(backend, cfg.threads, &cfg.agent_name, &cfg.whisper_model),
+            None => stt::Stt::whisper(
+                nv_core::paths::models_dir().join(model.as_str()),
+                cfg.threads,
+                &cfg.agent_name,
+            ),
         };
+        println!("engine: {}", stt.engine());
         let mut total = 0f64;
         for clip in clips {
             let Ok(bytes) = std::fs::read(clip) else {
                 eprintln!("cannot read {clip}");
                 continue;
             };
-            let audio: Vec<f32> = bytes[44..]
-                .chunks_exact(2)
-                .map(|b| i16::from_le_bytes([b[0], b[1]]) as f32 / 32768.0)
-                .collect();
+            let audio = nv_agent_wav(&bytes);
             let secs = audio.len() as f32 / 16000.0;
             // One warm-up run, then three timed ones.
             let _ = stt.transcribe(&audio);
@@ -258,4 +271,49 @@ fn main() {
     }
     log::info!("exiting");
     std::process::exit(0);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A minimal 16-bit WAV with `extra` bytes of chunk of our own before the
+    /// audio, which is what a `LIST` or `fact` chunk in a real file amounts to.
+    fn wav(extra_before_data: &[u8], samples: &[i16]) -> Vec<u8> {
+        let mut w = Vec::new();
+        let data_len = (samples.len() * 2) as u32;
+        w.extend(b"RIFF");
+        w.extend((36 + extra_before_data.len() as u32 + data_len).to_le_bytes());
+        w.extend(b"WAVEfmt ");
+        w.extend(16u32.to_le_bytes());
+        w.extend(1u16.to_le_bytes());
+        w.extend(1u16.to_le_bytes());
+        w.extend(16000u32.to_le_bytes());
+        w.extend(32000u32.to_le_bytes());
+        w.extend(2u16.to_le_bytes());
+        w.extend(16u16.to_le_bytes());
+        w.extend(extra_before_data);
+        w.extend(b"data");
+        w.extend(data_len.to_le_bytes());
+        for s in samples {
+            w.extend(s.to_le_bytes());
+        }
+        w
+    }
+
+    #[test]
+    fn wav_samples_are_found_at_the_data_chunk() {
+        let plain = wav(&[], &[0, 16384, -16384]);
+        let got = nv_agent_wav(&plain);
+        assert_eq!(got.len(), 3);
+        assert!((got[1] - 0.5).abs() < 1e-6, "{got:?}");
+
+        // The same audio behind a chunk of another kind must decode identically.
+        let padded = wav(b"LIST\x04\x00\x00\x00abcd", &[0, 16384, -16384]);
+        assert_eq!(nv_agent_wav(&padded), got);
+
+        // Rubbish in, empty out — never a panic on a short slice.
+        assert!(nv_agent_wav(b"RIFF").is_empty());
+        assert!(nv_agent_wav(b"").is_empty());
+    }
 }

@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use cpal::traits::{DeviceTrait, HostTrait};
-use eframe::egui::{self, Color32, RichText, Stroke};
+use eframe::egui::{self, Color32, RichText};
 use jobs::Job;
 use nv_core::apps::AppIndex;
 use nv_core::brain::Brain;
@@ -91,7 +91,10 @@ struct App {
     tab: Tab,
     status: Option<(String, Instant, bool)>,
     agent_running: bool,
-    last_poll: Instant,
+    /// When the running state was last asked for.
+    agent_checked: std::time::Instant,
+    /// Set while waiting for Start to actually take effect.
+    starting_since: Option<std::time::Instant>,
 
     mics: Vec<String>,
     system_voices: Vec<String>,
@@ -116,6 +119,63 @@ struct App {
     /// would rebuild the text from the parsed value, so a freshly typed newline
     /// or a trailing comma would vanish under the caret.
     drafts: std::collections::HashMap<String, String>,
+    /// The schedule, held rather than re-read: the tab used to call
+    /// `Schedule::open()` on every frame, which is a file read plus a JSON
+    /// parse sixty times a second while the page was open.
+    schedule: ScheduleStore,
+    /// The last answer from [`nv_core::win::find_python`], and when it was
+    /// asked for, so the Functions page does not search PATH every frame.
+    python_found: Option<PathBuf>,
+    python_searched: String,
+    python_checked: Instant,
+}
+
+/// The schedule file, with a cached copy of what was last read from it.
+///
+/// The list is shared with the agent and is edited by hand often enough that
+/// the file still has to be re-read, but only when it has actually changed —
+/// or when this window was the one that changed it.
+#[derive(Default)]
+struct ScheduleStore {
+    /// Kept so the `&Schedule` handed to the page outlives the call.
+    cache: Option<Schedule>,
+    stamp: Option<std::time::SystemTime>,
+    dirty: bool,
+}
+
+impl ScheduleStore {
+    fn modified() -> Option<std::time::SystemTime> {
+        std::fs::metadata(Schedule::path()).and_then(|m| m.modified()).ok()
+    }
+
+    /// The current list, re-reading the file only when it has moved on.
+    fn read(&mut self) -> &Schedule {
+        let stamp = Self::modified();
+        if self.dirty || self.cache.is_none() || stamp != self.stamp {
+            self.stamp = stamp;
+            self.dirty = false;
+            self.cache = Some(Schedule::open());
+        }
+        self.cache.as_ref().expect("just filled")
+    }
+
+    /// A copy to edit. The cache is refreshed on the next read, so a partial
+    /// edit never leaks back into the file.
+    fn edit(&mut self) -> Schedule {
+        let copy = self.read().clone();
+        self.dirty = true;
+        copy
+    }
+
+    /// Put an edited copy back, noting the file's new timestamp so the next
+    /// frame does not read our own write.
+    fn store(&mut self, schedule: Schedule) -> std::io::Result<()> {
+        let r = schedule.save();
+        self.stamp = Self::modified();
+        self.dirty = false;
+        self.cache = Some(schedule);
+        r
+    }
 }
 
 impl App {
@@ -159,7 +219,8 @@ impl App {
             tab,
             status: None,
             agent_running: win::is_running(nv_core::AGENT_EXE),
-            last_poll: Instant::now(),
+            agent_checked: std::time::Instant::now(),
+            starting_since: None,
             mics,
             system_voices,
             apps: AppIndex::load_cache().unwrap_or_default(),
@@ -174,6 +235,11 @@ impl App {
             bpe: nv_core::bpe::Bpe::load(&nv_core::wake_model::dir().join("bpe.model")),
             new_item: NewItem::default(),
             drafts: Default::default(),
+            schedule: ScheduleStore::default(),
+            // Long enough in the past that the first frame looks it up.
+            python_found: None,
+            python_searched: String::new(),
+            python_checked: Instant::now() - Duration::from_secs(60),
         }
     }
 
@@ -186,7 +252,7 @@ impl App {
     }
 
     fn save(&mut self) {
-        self.cfg = self.cfg.clone().sanitized();
+        self.cfg.sanitize();
         match self.cfg.save_to(&self.cfg_file) {
             Ok(()) => {
                 if let Err(e) = win::set_autostart(self.cfg.start_with_windows, &Self::agent_exe()) {
@@ -197,6 +263,11 @@ impl App {
                     self.toast("Saved", true);
                 }
                 self.saved = self.cfg.clone();
+                // Every text box is rebuilt from the stored value next frame:
+                // after normalising, a kept draft can hold something the config
+                // no longer says — a name that was trimmed, a phrase that was
+                // lowercased — and the box would go on showing it.
+                self.drafts.clear();
                 self.load_error = None;
             }
             Err(e) => self.toast(format!("Couldn't save: {e}"), false),
@@ -204,8 +275,15 @@ impl App {
     }
 
     fn start_agent(&mut self) {
+        if self.agent_running {
+            self.toast("The assistant is already running", true);
+            return;
+        }
         match win::spawn_detached(&Self::agent_exe(), &[]) {
-            Ok(()) => self.toast("Assistant started", true),
+            // Launching is not the same as running: the second copy of a
+            // singleton exits immediately, and a crash looks the same. Wait
+            // until it is really up before saying anything.
+            Ok(()) => self.starting_since = Some(std::time::Instant::now()),
             Err(e) => self.toast(format!("Couldn't start {}: {e}", Self::agent_exe().display()), false),
         }
     }
@@ -240,6 +318,22 @@ impl App {
 
     /// Collect finished jobs into toasts.
     fn poll_jobs(&mut self) {
+        // The agent can be started or stopped from the tray, the Start menu or a
+        // crash, so "is it running" has to be asked again rather than decided
+        // once at startup — which is why the button used to say "Start" at a
+        // running assistant, and did nothing when pressed.
+        if self.agent_checked.elapsed() > std::time::Duration::from_millis(700) {
+            self.agent_checked = std::time::Instant::now();
+            self.agent_running = win::is_running(nv_core::AGENT_EXE);
+        }
+        self.starting_since = match self.starting_since {
+            Some(_) if self.agent_running => None,
+            Some(t) if t.elapsed() > std::time::Duration::from_secs(8) => {
+                self.toast("The assistant did not start — see the log in the settings folder", false);
+                None
+            }
+            other => other,
+        };
         let mut finished = Vec::new();
         self.jobs.retain(|(k, j)| {
             let st = j.0.lock().unwrap();
@@ -273,7 +367,14 @@ impl App {
             let a = nv_core::brain::Action::OpenApp("Google Chrome".into());
             personality::line(self.cfg.personality, &Moment::Done(&a))
         });
-        let tmp = std::env::temp_dir().join("needlevoice-preview.toml");
+        // A file of its own per preview: two windows previewing at once used to
+        // share one path, and the second write could land between the first
+        // window's read and the agent's.
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        let tmp = std::env::temp_dir().join(format!("needlevoice-preview-{}-{stamp}.toml", std::process::id()));
         let mut c = self.cfg.clone();
         c.voice_enabled = true;
         if let Err(e) = c.save_to(&tmp) {
@@ -282,6 +383,7 @@ impl App {
         }
         let tmp_s = tmp.display().to_string();
         if let Err(e) = win::spawn_detached(&Self::agent_exe(), &["--say", &text, "--config", &tmp_s]) {
+            let _ = std::fs::remove_file(&tmp);
             self.toast(format!("Preview failed: {e}"), false);
         } else {
             self.toast("Playing preview… (neural voices take a second to load)", true);
@@ -300,8 +402,11 @@ impl App {
     }
 
     /// Throw away the buffers belonging to a function that no longer exists.
+    /// Keys are built as `"<kind>:<name>"`, so the whole key is compared —
+    /// matching on the tail alone also threw away the buffers of any other
+    /// function whose name happened to end with this one's.
     fn forget_buffers(&mut self, name: &str) {
-        self.drafts.retain(|k, _| !k.ends_with(name));
+        self.drafts.retain(|k, _| !k.ends_with(&format!(":{name}")));
     }
 
     fn tab_general(&mut self, ui: &mut egui::Ui, accent: Color32) {
@@ -608,6 +713,26 @@ impl App {
             ui::row(ui, "Wait after waking", "How long it stays ready for a command", |ui| {
                 ui.add(egui::Slider::new(&mut self.cfg.command_timeout_secs, 2.0..=15.0).suffix(" s"));
             });
+            ui::row(ui, "Bluetooth headsets", "Use another microphone when the headset's is a hands-free one", |ui| {
+                ui::switch(ui, &mut self.cfg.avoid_bluetooth_mic, "");
+            });
+            let in_use = self.cfg.microphone.clone();
+            if in_use.to_lowercase().contains("hands-free")
+                || in_use.to_lowercase().starts_with("headset")
+                || in_use.to_lowercase().contains("(headset")
+            {
+                ui.horizontal(|ui| {
+                    ui.add_space(14.0);
+                    ui::pill(ui, "hands-free microphone", ui::theme(ui).warn);
+                    ui::hint(
+                        ui,
+                        "This is the headset's own mic. While it is open the headset plays in mono, \
+                         telephone quality — pick another microphone (a webcam one, say) for full \
+                         sound, or switch this off to keep using it.",
+                    );
+                });
+                ui.add_space(6.0);
+            }
             ui::row(ui, "Set these for me", "The microphone check measures your voice and room", |ui| {
                 if ui::ghost(ui, "Run the check").clicked() {
                     self.mic_check = Some(miccheck::MicCheck::open());
@@ -763,7 +888,7 @@ impl App {
     fn tab_schedule(&mut self, ui: &mut egui::Ui, accent: Color32) {
         heading(ui, "Alarms & reminders", accent);
         let now = Stamp::now();
-        let mut schedule = Schedule::open();
+        let mut schedule = self.schedule.edit();
         let names: Vec<String> = self.cfg.custom_tools.iter().map(|t| t.name.clone()).collect();
         let mut dirty = false;
 
@@ -857,11 +982,18 @@ impl App {
             });
 
             let needs_time = self.new_item.kind.timed();
-            let ready = !self.new_item.text.trim().is_empty()
-                && (!needs_time || !self.new_item.when.trim().is_empty())
-                && nv_core::schedule_parse::parse(&self.new_item.when, now).is_ok();
-            if ui.add_enabled(ready, egui::Button::new("＋  Add")).clicked() {
-                match nv_core::schedule_parse::parse(&self.new_item.when, now) {
+            // A to-do has no time, so nothing the "when" box contains matters —
+            // including whatever was left in it from the last kind that was
+            // selected. It used to be parsed anyway, which left Add greyed out
+            // whenever that leftover text was not a time.
+            let parsed = if needs_time {
+                nv_core::schedule_parse::parse(&self.new_item.when, now)
+            } else {
+                Ok((now, Repeat::Once))
+            };
+            let ready = !self.new_item.text.trim().is_empty() && parsed.is_ok();
+            if ui.add_enabled(ready, egui::Button::new(RichText::new("＋  Add").size(13.0))).clicked() {
+                match parsed {
                     Ok((at, repeat)) => {
                         let repeat = if needs_time { repeat } else { Repeat::Once };
                         let id = schedule.add(Item {
@@ -892,12 +1024,16 @@ impl App {
             format!("Scheduled ({})", schedule.items.len())
         };
         section(ui, &title, |ui| {
-            // Soonest first; finished to-dos at the bottom.
-            let mut ids: Vec<u32> = schedule.items.iter().map(|i| i.id).collect();
-            ids.sort_by_key(|id| {
-                let item = schedule.get(*id).unwrap();
+            // Soonest first; finished to-dos at the bottom. Sorting by index
+            // rather than by id keeps the ids unique even if a hand-edited file
+            // repeats one — the lookup below used to assume that could not
+            // happen and would panic on the assumption.
+            let mut order: Vec<usize> = (0..schedule.items.len()).collect();
+            order.sort_by_key(|i| {
+                let item = &schedule.items[*i];
                 (item.done, item.next_after(now).unwrap_or(Stamp::new(9999, 1, 1, 0, 0)))
             });
+            let ids: Vec<u32> = order.iter().map(|i| schedule.items[*i].id).collect();
             let mut remove: Option<u32> = None;
             let mut test: Option<String> = None;
             ui.set_width(ui.available_width());
@@ -941,9 +1077,21 @@ impl App {
                         } else {
                             self.keep(&key, when);
                         }
-                        let label = match item.next_after(now) {
-                            Some(at) => describe_when(at, item.repeat, now),
-                            None => "gone".into(),
+                        // The item's own time, not the resolved next occurrence:
+                        // "every day at 7:30 am" must not read "today at 7:30 am",
+                        // and a spent one-off says so instead of showing a time.
+                        let label = if item.done {
+                            item.time_phrase(now).trim().to_string()
+                        } else {
+                            match item.next_after(now) {
+                                None => "gone".to_string(),
+                                Some(_) => {
+                                    let repeat = item.repeat_label();
+                                    let repeat =
+                                        if repeat.is_empty() { String::new() } else { format!(" {repeat}") };
+                                    format!("{}{repeat}", item.time_phrase(now).trim())
+                                }
+                            }
                         };
                         ui.add_sized(
                             [170.0, 18.0],
@@ -1011,9 +1159,8 @@ impl App {
         });
 
         if dirty {
-            match schedule.save() {
-                Ok(()) => {}
-                Err(e) => self.toast(format!("Couldn't save: {e}"), false),
+            if let Err(e) = self.schedule.store(schedule) {
+                self.toast(format!("Couldn't save: {e}"), false);
             }
         }
 
@@ -1027,7 +1174,7 @@ impl App {
         if export {
             let dir = nv_core::win::documents_folder().unwrap_or_else(nv_core::paths::data_dir);
             let path = dir.join("NeedleVoice.ics");
-            match std::fs::write(&path, schedule.to_ics(now)) {
+            match std::fs::write(&path, self.schedule.read().to_ics(now)) {
                 Ok(()) => {
                     let _ = win::shell_open(&dir.display().to_string(), None);
                     self.toast(format!("Wrote {}", path.display()), true);
@@ -1048,7 +1195,16 @@ impl App {
     /// function exists or the interpreter needs attention.
     fn python_ui(&mut self, ui: &mut egui::Ui) {
         let wants_python = self.cfg.custom_tools.iter().any(|t| t.kind == CustomKind::Python);
-        let found = nv_core::win::find_python(&self.cfg.python_path);
+        // Looking for Python walks the install folders and, failing that, every
+        // entry on PATH. Asking once a second is plenty and keeps the page
+        // responsive on a machine that does not have it at all.
+        let changed = self.cfg.python_path != self.python_searched;
+        if self.python_checked.elapsed() > Duration::from_secs(1) || changed {
+            self.python_checked = Instant::now();
+            self.python_searched = self.cfg.python_path.clone();
+            self.python_found = nv_core::win::find_python(&self.cfg.python_path);
+        }
+        let found = self.python_found.clone();
         if !wants_python && found.is_some() {
             return; // nothing to say: it just works
         }
@@ -1491,7 +1647,7 @@ impl App {
 
     /// Everything Needle is allowed to do: the built-ins it may call, and the
     /// functions you wrote yourself.
-    fn tab_functions(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, accent: Color32) {
+    fn tab_functions(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, _accent: Color32) {
         let _ = ctx;
         self.python_ui(ui);
 
@@ -1723,7 +1879,8 @@ impl App {
                             hint(
                                 ui,
                                 &format!(
-                                    "Use {{output}} for what the previous script printed, and {{param}} for your parameters. Functions you can call: {}",
+                                    "Use {{output}} for what the previous script printed, and {{param}} for your parameters. \
+                                     Both spellings work, with one brace or two. Functions you can call: {}",
                                     if function_names.is_empty() { "(none yet)".to_string() } else { function_names.join(", ") }
                                 ),
                             );
@@ -1766,19 +1923,26 @@ impl App {
         }
         // ── start from a template ───────────────────────────────────────
         let mut add: Option<CustomTool> = None;
+        let mut add_blank = false;
         section(ui, "Add a function", |ui| {
             hint(ui, "Templates are ready to use — add one, then tweak it. They respect the switches in your config, so shutdown and sleep still ask nothing of Needle.");
             ui.horizontal_wrapped(|ui| {
-                for t in tools::templates() {
+                // The catalogue is built once per frame rather than once per
+                // button: `templates()` builds every step of every sequence.
+                let templates = tools::templates();
+                for t in &templates {
                     if ui.button(format!("+ {}", pretty_name(&t.label()))).on_hover_text(&t.description).clicked() {
-                        add = Some(t);
+                        add = Some(t.clone());
                     }
                 }
                 if ui.button("+ Blank function").clicked() {
-                    add = Some(CustomTool { name: "new_function".into(), description: String::new(), ..Default::default() });
+                    add_blank = true;
                 }
             });
         });
+        if add_blank {
+            add = Some(CustomTool { name: "new_function".into(), description: String::new(), ..Default::default() });
+        }
         if let Some(t) = add {
             let label = pretty_name(&t.label());
             self.add_function(t);
@@ -1956,16 +2120,6 @@ fn section(ui: &mut egui::Ui, title: &str, body: impl FnOnce(&mut egui::Ui)) {
     ui::card(ui, title, "", body);
 }
 
-fn orb(ui: &egui::Ui, rect: egui::Rect, c: Color32) {
-    let p = ui.painter();
-    let center = rect.center();
-    let r = rect.width().min(rect.height()) / 2.0;
-    p.circle_filled(center, r, c.linear_multiply(0.18));
-    p.circle_filled(center, r * 0.78, Color32::from_rgb(10, 11, 16));
-    p.circle_filled(center + egui::vec2(-r * 0.2, -r * 0.15), r * 0.42, c.linear_multiply(0.75));
-    p.circle_stroke(center, r * 0.78, Stroke::new(1.6, c));
-}
-
 #[cfg(test)]
 mod typing_tests {
     use super::*;
@@ -2043,6 +2197,73 @@ mod typing_tests {
         frame(&ctx, vec![press_enter()], |ui| phrases_field(ui, &mut draft, &mut stored));
         assert_eq!(stored.len(), 2);
         assert!(draft.ends_with('\n'), "{draft:?}");
+    }
+}
+
+#[cfg(test)]
+mod schedule_store_tests {
+    use super::*;
+
+    /// A schedule file of our own, so the tests never touch the real list.
+    struct TempSchedule {
+        path: PathBuf,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    /// The override is an environment variable, so tests using it take turns.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    impl TempSchedule {
+        fn new(tag: &str) -> TempSchedule {
+            let lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let dir = std::env::temp_dir().join("nv-config-schedule-test");
+            let _ = std::fs::create_dir_all(&dir);
+            let path = dir.join(format!("{tag}-{}.json", std::process::id()));
+            let _ = std::fs::remove_file(&path);
+            std::env::set_var("NV_SCHEDULE_FILE", &path);
+            TempSchedule { path, _lock: lock }
+        }
+    }
+
+    impl Drop for TempSchedule {
+        fn drop(&mut self) {
+            std::env::remove_var("NV_SCHEDULE_FILE");
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+
+    /// The page is drawn sixty times a second, so the store must hand back the
+    /// same list without touching the file — but it must also notice an edit
+    /// made by the agent or by hand, and never read back its own half-finished
+    /// edit.
+    #[test]
+    fn the_schedule_is_cached_until_it_changes() {
+        let _guard = TempSchedule::new("store");
+        let mut store = ScheduleStore::default();
+
+        assert!(store.read().items.is_empty());
+        let mut edit = store.edit();
+        edit.add(Item { kind: ItemKind::Todo, text: "buy milk".into(), ..Default::default() });
+        store.store(edit).unwrap();
+        assert_eq!(store.read().items.len(), 1, "the store must keep what it just saved");
+
+        // Another writer (the agent, or a text editor) changes the file.
+        let mut other = Schedule::open();
+        other.add(Item { kind: ItemKind::Alarm, text: "wake up".into(), ..Default::default() });
+        other.save().unwrap();
+        assert_eq!(store.read().items.len(), 2, "an outside change must be picked up");
+
+        // An edit that is thrown away must not come back from the cache.
+        let abandoned = store.edit();
+        drop(abandoned);
+        assert_eq!(store.read().items.len(), 2);
+
+        // Nothing is written until `store` is called.
+        let mut edit = store.edit();
+        edit.clear(None);
+        assert_eq!(Schedule::open().items.len(), 2, "an uncommitted edit must stay in memory");
+        store.store(edit).unwrap();
+        assert!(Schedule::open().items.is_empty());
     }
 }
 

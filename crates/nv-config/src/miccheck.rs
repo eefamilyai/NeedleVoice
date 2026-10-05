@@ -11,6 +11,9 @@ use nv_core::{wake, Config};
 
 const QUIET_SECS: f32 = 3.0;
 const SPEAK_MAX_SECS: f32 = 8.0;
+/// Ceiling on the clip kept for transcribing, per microphone. The speaking step
+/// is at most eight seconds; this leaves room for a device clock that runs fast.
+const MAX_SPEAK_SAMPLES: usize = 192_000 * 12;
 
 /// What a mic's callback is collecting right now.
 const REC_OFF: u8 = 0;
@@ -172,7 +175,13 @@ impl MicCheck {
                         REC_QUIET => st.quiet_blocks.lock().unwrap().push(d),
                         REC_SPEAK => {
                             st.speak_blocks.lock().unwrap().push(d);
-                            st.speak_audio.lock().unwrap().extend_from_slice(&mono);
+                            // The clip kept for transcribing is capped: a long
+                            // monologue at 48 kHz is megabytes per microphone,
+                            // and only the first few seconds are ever used.
+                            let mut audio = st.speak_audio.lock().unwrap();
+                            if audio.len() < MAX_SPEAK_SAMPLES {
+                                audio.extend_from_slice(&mono);
+                            }
                         }
                         _ => {}
                     }
@@ -303,7 +312,12 @@ impl MicCheck {
         };
 
         // Run the real recogniser (the agent exe) on what the best mic heard.
-        let mic = self.mics.iter().find(|m| m.name == best.name).unwrap();
+        let Some(mic) = self.mics.iter().find(|m| m.name == best.name) else {
+            // The device went away between measuring it and using it.
+            self.result = Some(cal);
+            self.phase = Phase::Idle;
+            return;
+        };
         let audio = resample(&mic.speak_audio.lock().unwrap(), mic.rate, 16_000);
         let g = 10f32.powf(gain_db / 20.0);
         let wav = std::env::temp_dir().join("needlevoice-miccheck.wav");

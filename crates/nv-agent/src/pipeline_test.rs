@@ -8,9 +8,10 @@ use nv_core::brain::Brain;
 use nv_core::{wake, Config};
 
 fn read_wav(path: &std::path::Path) -> Vec<f32> {
+    // The same reader the agent uses, so a clip that the harness cannot read is
+    // a clip the assistant could not either.
     let bytes = std::fs::read(path).unwrap();
-    let pos = bytes.windows(4).position(|w| w == b"data").unwrap() + 8;
-    bytes[pos..].chunks_exact(2).map(|b| i16::from_le_bytes([b[0], b[1]]) as f32 / 32768.0).collect()
+    crate::nv_agent_wav(&bytes)
 }
 
 #[test]
@@ -157,7 +158,7 @@ fn mic_probe() {
 #[test]
 #[ignore]
 fn live_wake() {
-    let mic = crate::audio::Mic::open(&std::env::var("NV_MIC").unwrap_or_default()).unwrap();
+    let mic = crate::audio::Mic::open(&std::env::var("NV_MIC").unwrap_or_default(), true).unwrap();
     let start = Instant::now();
     let mut audio: Vec<f32> = Vec::new();
     let secs: u64 = std::env::var("NV_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(10);
@@ -222,7 +223,7 @@ fn auto_mic() {
     }
     let _ = log::set_logger(&L);
     log::set_max_level(log::LevelFilter::Info);
-    let m = crate::audio::Mic::open("").unwrap();
+    let m = crate::audio::Mic::open("", true).unwrap();
     let t = Instant::now();
     while t.elapsed().as_secs() < 8 { let _ = m.rx.recv_timeout(std::time::Duration::from_millis(100)); }
 }

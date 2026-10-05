@@ -67,16 +67,19 @@ pub enum SttEngine {
     /// sherpa-onnx Moonshine: built for short utterances, a fraction of a second
     /// on a CPU.
     Moonshine,
+    /// SenseVoice: one model, no token-by-token decoding, English and Chinese.
+    SenseVoice,
     /// whisper.cpp, with the model chosen in Settings.
     Whisper,
 }
 
 impl SttEngine {
-    pub const ALL: [SttEngine; 2] = [SttEngine::Moonshine, SttEngine::Whisper];
+    pub const ALL: [SttEngine; 3] = [SttEngine::Moonshine, SttEngine::SenseVoice, SttEngine::Whisper];
 
     pub fn label(self) -> &'static str {
         match self {
             SttEngine::Moonshine => "Moonshine",
+            SttEngine::SenseVoice => "SenseVoice",
             SttEngine::Whisper => "Whisper",
         }
     }
@@ -172,6 +175,11 @@ pub struct Config {
     pub command_timeout_secs: f32,
     /// Which speech recogniser to use.
     pub stt_engine: SttEngine,
+    /// Use a different microphone when the chosen one is a Bluetooth headset's
+    /// hands-free one. Off by default: the said device wins, because a headset
+    /// microphone is usually the one that can actually hear you, and quietly
+    /// switching away from it is how the assistant stops responding.
+    pub avoid_bluetooth_mic: bool,
     /// Save every clip the recogniser is given, for working out why a word came
     /// through wrong. They land in `clips/` next to the settings file.
     pub save_clips: bool,
@@ -266,6 +274,7 @@ impl Default for Config {
             end_silence_ms: 800,
             command_timeout_secs: 5.0,
             stt_engine: SttEngine::Moonshine,
+            avoid_bluetooth_mic: false,
             save_clips: false,
             whisper_model: crate::DEFAULT_WHISPER_MODEL.into(),
             threads: recommended_threads(),
@@ -353,6 +362,13 @@ impl Config {
 
     /// Clamp values into ranges the agent can work with.
     pub fn sanitized(mut self) -> Self {
+        self.sanitize();
+        self
+    }
+
+    /// [`Config::sanitized`] without the copy, for callers that already own the
+    /// value — the settings app normalises the live config on every save.
+    pub fn sanitize(&mut self) {
         self.wake_sensitivity = self.wake_sensitivity.clamp(0.0, 1.0);
         self.vad_aggressiveness = self.vad_aggressiveness.min(3);
         self.min_speech_db = self.min_speech_db.clamp(-80.0, -10.0);
@@ -368,7 +384,8 @@ impl Config {
         if parse_hex(&self.accent_color).is_none() {
             self.accent_color = Self::default().accent_color;
         }
-        if self.agent_name.trim().is_empty() {
+        self.agent_name = self.agent_name.trim().to_string();
+        if self.agent_name.is_empty() {
             self.agent_name = "Nova".into();
         }
         if !self.search_url.contains("{}") {
@@ -380,16 +397,28 @@ impl Config {
         if self.wake_threshold != 0.0 {
             self.wake_threshold = self.wake_threshold.clamp(0.02, 0.9);
         }
-        self.wake_extra_names = self
-            .wake_extra_names
-            .iter()
-            .map(|n| n.trim().to_lowercase())
-            .filter(|n| !n.is_empty() && n != &self.agent_name.to_lowercase())
-            .collect();
-        self.wake_extra_names.dedup();
+        // The name of the assistant is the thing extra spellings must not
+        // duplicate — compared lowercased, like everything else here. `dedup`
+        // only ever removed *adjacent* repeats, so "no va, nova, no va" kept
+        // both copies of "no va".
+        let name = self.agent_name.to_lowercase();
+        let mut extra: Vec<String> = Vec::with_capacity(self.wake_extra_names.len());
+        for n in &self.wake_extra_names {
+            let n = n.trim().to_lowercase();
+            if !n.is_empty() && n != name && !extra.contains(&n) {
+                extra.push(n);
+            }
+        }
+        self.wake_extra_names = extra;
         // Functions: names must be valid, unique and not shadow a built-in.
-        self.custom_tools = crate::tools::sanitize_tools(self.custom_tools, &self.disabled_tools);
-        self
+        // Each function is cleaned individually: normalising the whole list
+        // logs its warnings and rebuilds every entry, which is too much to do
+        // for one edited row.
+        let mut tools = std::mem::take(&mut self.custom_tools);
+        for t in &mut tools {
+            crate::tools::sanitize_tool(t);
+        }
+        self.custom_tools = crate::tools::dedupe_tools(tools);
     }
 
     /// Where Python functions keep their scripts. Created on demand.

@@ -437,13 +437,53 @@ pub fn template_steps(name: &str) -> Vec<Step> {
 
 /// Fill `{param}` slots from the captured parameters. `encode` percent-encodes
 /// the values, which is what URLs want and plain text does not.
+///
+/// One pass, with the longest parameter name winning at each position: once
+/// `{query}` has been filled in, the text that replaced it is not scanned
+/// again, so a value containing braces — or a function with both `q` and
+/// `query` — cannot be mangled by a second substitution. `{{ query }}`, a
+/// capitalised `{QUERY}` and inner padding are all accepted.
 pub fn substitute(text: &str, params: &[(String, String)], encode: bool) -> String {
-    let mut out = text.to_string();
-    for (k, v) in params {
-        let value = if encode { crate::fuzzy::url_encode(v) } else { v.clone() };
-        out = out.replace(&format!("{{{k}}}"), &value);
-        // Tolerate "{{ query }}" and a capitalised placeholder.
-        out = out.replace(&format!("{{{}}}", k.to_uppercase()), &value);
+    if params.is_empty() || !text.contains('{') {
+        return text.to_string();
+    }
+    let mut order: Vec<usize> = (0..params.len()).collect();
+    order.sort_by_key(|&i| std::cmp::Reverse(params[i].0.len()));
+    let mut out = String::with_capacity(text.len() + 32);
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != b'{' {
+            let next = text[i..].find('{').map(|at| i + at).unwrap_or(text.len());
+            out.push_str(&text[i..next]);
+            i = next;
+            continue;
+        }
+        // `{{ name }}` or `{name}`.
+        let open = if bytes.get(i + 1) == Some(&b'{') { i + 2 } else { i + 1 };
+        let Some(close) = text[open..].find('}').map(|at| open + at) else {
+            out.push_str(&text[i..]);
+            break;
+        };
+        let key = text[open..close].trim();
+        let doubled = bytes.get(close + 1) == Some(&b'}');
+        let end = if doubled { close + 2 } else { close + 1 };
+        // Longest name first, so "query" is preferred over "q" at this position.
+        let hit = order
+            .iter()
+            .map(|&p| (params[p].0.as_str(), params[p].1.as_str()))
+            .find(|(name, _)| name.eq_ignore_ascii_case(key));
+        match hit {
+            Some((_, value)) => {
+                if encode {
+                    out.push_str(&crate::fuzzy::url_encode(value));
+                } else {
+                    out.push_str(value);
+                }
+            }
+            None => out.push_str(&text[i..end]),
+        }
+        i = end;
     }
     out
 }
@@ -471,9 +511,61 @@ pub fn sanitize_name(s: &str) -> String {
 /// Clean up the saved function list: valid, unique names that don't shadow a
 /// built-in; valid parameter names; no stray whitespace.
 pub fn sanitize_tools(tools: Vec<CustomTool>, _disabled: &[String]) -> Vec<CustomTool> {
+    let mut tools = tools;
+    for t in &mut tools {
+        sanitize_tool(t);
+    }
+    dedupe_tools(tools)
+}
+
+/// The per-function half of [`sanitize_tools`]: a usable name, parameter names,
+/// and trimmed text. Nothing here rejects the function — [`dedupe_tools`] does
+/// that — so it is safe to call on one entry of a list, which is what the
+/// settings app does for the row being edited.
+pub fn sanitize_tool(t: &mut CustomTool) {
+    t.name = sanitize_name(&t.name);
+    t.description = t.description.trim().to_string();
+    if t.description.is_empty() && !t.name.is_empty() {
+        t.description = t.name.replace('_', " ");
+    }
+    let mut params: Vec<String> = Vec::new();
+    for p in &t.params {
+        let p = sanitize_name(p);
+        if !p.is_empty() && !params.contains(&p) {
+            params.push(p);
+        }
+    }
+    t.params = params;
+    t.phrases = t
+        .phrases
+        .iter()
+        .map(|p| p.trim().to_lowercase())
+        .filter(|p| !p.is_empty())
+        .collect();
+    // A phrase written twice is two chances to match nothing new.
+    let mut seen: Vec<String> = Vec::with_capacity(t.phrases.len());
+    t.phrases.retain(|p| {
+        if seen.iter().any(|s| s == p) {
+            return false;
+        }
+        seen.push(p.clone());
+        true
+    });
+    t.target = t.target.trim().to_string();
+    t.args = t.args.trim().to_string();
+    t.reply = t.reply.trim().to_string();
+    t.steps.retain(|s| !(s.target.trim().is_empty() && s.kind != StepKind::Wait));
+    for s in &mut t.steps {
+        s.target = s.target.trim().to_string();
+        s.args = s.args.trim().to_string();
+    }
+}
+
+/// Drop the functions that cannot be called: no usable name, one that shadows a
+/// built-in, or a duplicate of one already kept.
+pub fn dedupe_tools(tools: Vec<CustomTool>) -> Vec<CustomTool> {
     let mut out: Vec<CustomTool> = Vec::with_capacity(tools.len());
-    for mut t in tools {
-        t.name = sanitize_name(&t.name);
+    for t in tools {
         if t.name.is_empty() || is_builtin(&t.name) {
             log::warn!("ignoring function with unusable name {:?}", t.name);
             continue;
@@ -481,33 +573,6 @@ pub fn sanitize_tools(tools: Vec<CustomTool>, _disabled: &[String]) -> Vec<Custo
         if out.iter().any(|o| o.name == t.name) {
             log::warn!("ignoring duplicate function {:?}", t.name);
             continue;
-        }
-        t.description = t.description.trim().to_string();
-        if t.description.is_empty() {
-            t.description = t.name.replace('_', " ");
-        }
-        let mut params: Vec<String> = Vec::new();
-        for p in &t.params {
-            let p = sanitize_name(p);
-            if !p.is_empty() && !params.contains(&p) {
-                params.push(p);
-            }
-        }
-        t.params = params;
-        t.phrases = t
-            .phrases
-            .iter()
-            .map(|p| p.trim().to_lowercase())
-            .filter(|p| !p.is_empty())
-            .collect();
-        t.phrases.dedup();
-        t.target = t.target.trim().to_string();
-        t.args = t.args.trim().to_string();
-        t.reply = t.reply.trim().to_string();
-        t.steps.retain(|s| !(s.target.trim().is_empty() && s.kind != StepKind::Wait));
-        for s in &mut t.steps {
-            s.target = s.target.trim().to_string();
-            s.args = s.args.trim().to_string();
         }
         if t.kind == CustomKind::Sequence && t.steps.is_empty() {
             log::warn!("function {:?} has no steps", t.name);
@@ -812,6 +877,35 @@ mod tests {
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].name, "my_thing");
         assert_eq!(out[0].params, vec!["query"]);
+    }
+
+    /// Placeholders are filled in one pass, so a value is never substituted
+    /// into, and a parameter whose name is a prefix of another one cannot eat
+    /// part of it.
+    #[test]
+    fn placeholders_are_filled_exactly_once() {
+        let p = |k: &str, v: &str| (k.to_string(), v.to_string());
+        // The URL form: + is a space in a query string, so the filled value is
+        // encoded while the template's own wording is left as written.
+        assert_eq!(substitute("search {query}", &[p("query", "daft punk")], true), "search daft+punk");
+        assert_eq!(substitute("https://x/?q={query}", &[p("query", "a b")], true), "https://x/?q=a+b");
+        assert_eq!(substitute("search {query}", &[p("query", "daft punk")], false), "search daft punk");
+        // `{q}` must not clip the "q" out of `{query}`.
+        assert_eq!(
+            substitute("{query} then {q}", &[p("q", "x"), p("query", "daft punk")], false),
+            "daft punk then x"
+        );
+        // A value that itself contains braces is not re-substituted.
+        assert_eq!(substitute("{a}", &[p("a", "{b}"), p("b", "no")], false), "{b}");
+        // Spelling variants people actually type.
+        assert_eq!(substitute("{{ query }}", &[p("query", "jazz")], false), "jazz");
+        assert_eq!(substitute("{QUERY}", &[p("query", "jazz")], false), "jazz");
+        assert_eq!(substitute("{ query }", &[p("query", "jazz")], false), "jazz");
+        // An unknown placeholder is left alone rather than dropped.
+        assert_eq!(substitute("{nope}", &[p("query", "jazz")], false), "{nope}");
+        // No parameters at all is a no-op, and no brace is required.
+        assert_eq!(substitute("plain text", &[], false), "plain text");
+        assert_eq!(substitute("{a}", &[], false), "{a}");
     }
 
     #[test]

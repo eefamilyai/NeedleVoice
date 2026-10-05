@@ -10,6 +10,9 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use windows::Win32::UI::Shell::IShellItem;
+use windows::core::Interface;
+
 use crate::config::Config;
 use crate::fuzzy;
 use crate::win;
@@ -46,6 +49,14 @@ impl AppEntry {
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct AppIndex {
     pub apps: Vec<AppEntry>,
+    /// Normalised and space-free forms of each name, parallel to `apps`, so
+    /// scoring a spoken name against every installed app does not re-normalise
+    /// every app name on every command. Rebuilt by [`AppIndex::reindex`] and
+    /// not serialised: the cache stores `apps` alone.
+    #[serde(skip)]
+    pub normalized: Vec<String>,
+    #[serde(skip)]
+    pub squashed: Vec<String>,
 }
 
 /// Entries that are never what someone means by "open X".
@@ -69,18 +80,26 @@ impl AppIndex {
     /// Load the cached list written by the last scan (fast, for startup).
     pub fn load_cache() -> Option<Self> {
         let text = std::fs::read_to_string(crate::paths::apps_cache_file()).ok()?;
-        serde_json::from_str(&text).ok()
+        serde_json::from_str::<Self>(&text).ok().map(AppIndex::reindex)
     }
 
     pub fn save_cache(&self) {
-        if let Ok(text) = serde_json::to_string_pretty(self) {
-            let _ = std::fs::write(crate::paths::apps_cache_file(), text);
+        let Ok(text) = serde_json::to_string(self) else { return };
+        // Write-then-rename: the agent reads this on startup, and a half-written
+        // cache read or killed mid-write used to leave a file that never parsed
+        // again, so every start fell back to a cold scan.
+        let path = crate::paths::apps_cache_file();
+        let tmp = path.with_extension("json.tmp");
+        if std::fs::write(&tmp, text).is_ok() && std::fs::rename(&tmp, &path).is_err() {
+            let _ = std::fs::remove_file(&tmp);
         }
     }
 
     /// Full scan. Takes a few hundred milliseconds; run it off the UI thread.
     pub fn scan(cfg: &Config) -> Self {
         win::com_init();
+        // Keyed on the normalised name, so "Visual Studio Code" from the Start
+        // menu and from a shortcut folder end up as one entry.
         let mut by_name: HashMap<String, AppEntry> = HashMap::new();
 
         for app in scan_apps_folder() {
@@ -96,24 +115,25 @@ impl AppIndex {
         for folder in folders {
             for (name, path) in scan_folder(&folder, 0) {
                 let key = fuzzy::normalize(&name);
-                // Resolving a .lnk is a COM round-trip; only do it when we need the exe.
-                if by_name.get(&key).is_some_and(|e| e.exe.is_some()) {
+                // A shortcut we have not seen before.
+                let Some(existing) = by_name.get_mut(&key) else {
+                    let exe = exe_from(&path.to_string_lossy());
+                    by_name.insert(
+                        key,
+                        AppEntry { name, app_id: None, path: Some(path.display().to_string()), exe },
+                    );
+                    continue;
+                };
+                // Known already: only worth a COM round-trip to resolve a .lnk
+                // when we are still missing the exe name needed to close it.
+                if existing.exe.is_some() {
                     continue;
                 }
-                let exe = if path.extension().is_some_and(|e| e.eq_ignore_ascii_case("lnk")) {
+                existing.exe = if path.extension().is_some_and(|e| e.eq_ignore_ascii_case("lnk")) {
                     win::shortcut_target(&path).and_then(|t| exe_from(&t.to_string_lossy()))
                 } else {
                     exe_from(&path.to_string_lossy())
                 };
-                match by_name.get_mut(&key) {
-                    Some(existing) => existing.exe = exe,
-                    None => {
-                        by_name.insert(
-                            key,
-                            AppEntry { name, app_id: None, path: Some(path.display().to_string()), exe },
-                        );
-                    }
-                }
             }
         }
 
@@ -122,8 +142,21 @@ impl AppIndex {
         }
 
         let mut apps: Vec<AppEntry> = by_name.into_values().filter(|a| !is_junk(&a.name)).collect();
-        apps.sort_by_key(|a| a.name.to_lowercase());
-        AppIndex { apps }
+        apps.sort_by_cached_key(|a| a.name.to_lowercase());
+        AppIndex { apps, ..Default::default() }.reindex()
+    }
+
+    /// An index over a known list of names, with the lookup tables built.
+    /// Used by the tests and by anything that does not need a real scan.
+    pub fn from_names(names: impl IntoIterator<Item = AppEntry>) -> Self {
+        AppIndex { apps: names.into_iter().collect(), ..Default::default() }.reindex()
+    }
+
+    /// Rebuild the parallel lookup tables [`AppIndex::best_match`] scans.
+    pub fn reindex(mut self) -> Self {
+        self.normalized = self.apps.iter().map(|a| fuzzy::normalize(&a.name)).collect();
+        self.squashed = self.normalized.iter().map(|n| n.replace(' ', "")).collect();
+        self
     }
 
     /// Best app for a spoken name, honouring aliases and exclusions.
@@ -148,13 +181,25 @@ impl AppIndex {
     }
 
     fn best_match(&self, spoken: &str, cfg: &Config) -> Option<(AppEntry, f64)> {
+        // Exclusion matching used to re-normalise every app name for every
+        // candidate, per command; the list is small but the index is not.
         let excluded: Vec<String> = cfg.excluded_apps.iter().map(|e| fuzzy::normalize(e)).collect();
         let mut best: Option<(&AppEntry, f64)> = None;
-        for app in &self.apps {
-            if excluded.contains(&fuzzy::normalize(&app.name)) {
+        for (i, app) in self.apps.iter().enumerate() {
+            // The parallel tables are missing for an index built by hand (the
+            // tests) rather than by `scan`, which normalises on demand instead.
+            let owned;
+            let (normal, squashed) = match (self.normalized.get(i), self.squashed.get(i)) {
+                (Some(n), Some(s)) => (n.as_str(), s.as_str()),
+                _ => {
+                    owned = (fuzzy::normalize(&app.name), fuzzy::squash(&app.name));
+                    (owned.0.as_str(), owned.1.as_str())
+                }
+            };
+            if excluded.iter().any(|e| e == normal) {
                 continue;
             }
-            let s = fuzzy::app_score(spoken, &app.name);
+            let s = fuzzy::app_score_prepared(spoken, normal, squashed);
             // On ties prefer the shorter name: "Chrome" over "Chrome Remote Desktop".
             let better = match best {
                 None => true,
@@ -176,13 +221,7 @@ fn looks_like_target(t: &str) -> bool {
 /// Enumerate `shell:AppsFolder`, the Start menu's own app list.
 fn scan_apps_folder() -> Vec<AppEntry> {
     use windows::core::HSTRING;
-    use windows::Win32::Storage::EnhancedStorage::{PKEY_AppUserModel_ID, PKEY_Link_TargetParsingPath};
-    use windows::Win32::System::Com::CoTaskMemFree;
-    use windows::Win32::UI::Shell::{
-        BHID_EnumItems, IEnumShellItems, IShellItem, IShellItem2, SHCreateItemFromParsingName,
-        SIGDN_NORMALDISPLAY,
-    };
-    use windows::core::Interface;
+    use windows::Win32::UI::Shell::{BHID_EnumItems, IEnumShellItems, SHCreateItemFromParsingName};
 
     let mut out = Vec::new();
     unsafe {
@@ -192,33 +231,49 @@ fn scan_apps_folder() -> Vec<AppEntry> {
         let Ok(items) = folder.BindToHandler::<_, IEnumShellItems>(None, &BHID_EnumItems) else {
             return out;
         };
+        // Ask for the items in batches: `Next` is a COM round trip per call on
+        // some shells, and the Start menu has a few hundred entries.
+        const BATCH: usize = 32;
+        let mut batch: [Option<IShellItem>; BATCH] = [const { None }; BATCH];
         loop {
-            let mut batch: [Option<IShellItem>; 1] = [None];
             let mut fetched = 0u32;
             if items.Next(&mut batch, Some(&mut fetched)).is_err() || fetched == 0 {
                 break;
             }
-            let Some(item) = batch[0].take() else { break };
-            let Ok(name_ptr) = item.GetDisplayName(SIGDN_NORMALDISPLAY) else { continue };
-            let name = name_ptr.to_string().unwrap_or_default();
-            CoTaskMemFree(Some(name_ptr.0 as *const _));
-            let Ok(item2) = item.cast::<IShellItem2>() else { continue };
-            let read = |key| -> Option<String> {
-                let p = item2.GetString(key).ok()?;
-                let s = p.to_string().ok();
-                CoTaskMemFree(Some(p.0 as *const _));
-                s.filter(|s| !s.is_empty())
-            };
-            let app_id = read(&PKEY_AppUserModel_ID);
-            let target = read(&PKEY_Link_TargetParsingPath);
-            if name.trim().is_empty() || app_id.is_none() {
-                continue;
+            for slot in batch.iter_mut().take(fetched as usize) {
+                let Some(item) = slot.take() else { continue };
+                out.extend(read_app_item(&item));
             }
-            let exe = target.as_deref().and_then(exe_from).or_else(|| app_id.as_deref().and_then(exe_from));
-            out.push(AppEntry { name, app_id, path: None, exe });
         }
     }
     out
+}
+
+/// One entry of `shell:AppsFolder` as an [`AppEntry`], or nothing when it isn't
+/// a launchable app (no AppUserModelID, or no display name).
+fn read_app_item(item: &IShellItem) -> Option<AppEntry> {
+    use windows::Win32::Storage::EnhancedStorage::{PKEY_AppUserModel_ID, PKEY_Link_TargetParsingPath};
+    use windows::Win32::System::Com::CoTaskMemFree;
+    use windows::Win32::UI::Shell::{IShellItem2, SIGDN_NORMALDISPLAY};
+    unsafe {
+        let name_ptr = item.GetDisplayName(SIGDN_NORMALDISPLAY).ok()?;
+        let name = name_ptr.to_string().unwrap_or_default();
+        CoTaskMemFree(Some(name_ptr.0 as *const _));
+        let item2 = item.cast::<IShellItem2>().ok()?;
+        let read = |key| -> Option<String> {
+            let p = item2.GetString(key).ok()?;
+            let s = p.to_string().ok();
+            CoTaskMemFree(Some(p.0 as *const _));
+            s.filter(|s| !s.is_empty())
+        };
+        let app_id = read(&PKEY_AppUserModel_ID)?;
+        let target = read(&PKEY_Link_TargetParsingPath);
+        if name.trim().is_empty() {
+            return None;
+        }
+        let exe = target.as_deref().and_then(exe_from).or_else(|| exe_from(&app_id));
+        Some(AppEntry { name, app_id: Some(app_id), path: None, exe })
+    }
 }
 
 /// Recursively collect `.lnk` / `.exe` files (max depth 3).

@@ -41,10 +41,24 @@ pub fn strip_filler(s: &str) -> String {
 pub fn app_score(query: &str, candidate: &str) -> f64 {
     let q = strip_filler(query);
     let c = normalize(candidate);
+    let (qs, cs) = (squash(&q), squash(&c));
+
+    score_prepared(&q, &qs, &c, &cs)
+}
+
+/// [`app_score`] against a name whose normalised and squashed forms are already
+/// known, so scanning a few hundred installed apps does not re-normalise every
+/// name for every command.
+pub fn app_score_prepared(query: &str, candidate_normalized: &str, candidate_squashed: &str) -> f64 {
+    let q = strip_filler(query);
+    let qs = squash(&q);
+    score_prepared(&q, &qs, candidate_normalized, candidate_squashed)
+}
+
+fn score_prepared(q: &str, qs: &str, c: &str, cs: &str) -> f64 {
     if q.is_empty() || c.is_empty() {
         return 0.0;
     }
-    let (qs, cs) = (q.replace(' ', ""), c.replace(' ', ""));
     if qs == cs {
         return 1.0;
     }
@@ -69,23 +83,39 @@ pub fn app_score(query: &str, candidate: &str) -> f64 {
     }
 
     // Name starts with the query: "photo" -> "photoshop".
-    if cs.starts_with(&qs) && qs.len() >= 4 {
+    if cs.starts_with(qs) && qs.len() >= 4 {
         best = best.max(0.8 + 0.15 * (qs.len() as f64 / cs.len() as f64));
     }
 
     // Whole-string similarity handles mis-hearings: "spotty fi" -> "spotify".
-    best = best.max(strsim::jaro_winkler(&qs, &cs) * 0.97);
+    // Cheap length rejection first: every candidate app in the index would
+    // otherwise pay for a full Jaro-Winkler table, and the great majority of
+    // them are nothing like what was said.
+    if plausible(qs, cs) {
+        best = best.max(strsim::jaro_winkler(qs, cs) * 0.97);
+    }
 
     // Best similarity against any single word of the name, for long names
     // where the speaker used one distinctive word ("photoshop").
     if q_words.len() == 1 && qs.len() >= 4 {
-        for w in &c_words {
-            if w.len() >= 4 {
-                best = best.max(strsim::jaro_winkler(&qs, w) * 0.9);
+        for w in c_words.iter() {
+            if w.len() >= 4 && plausible(qs, w) {
+                best = best.max(strsim::jaro_winkler(qs, w) * 0.9);
             }
         }
     }
     best
+}
+
+/// Cheap gate for an expensive string comparison: two strings whose lengths
+/// differ by more than a third cannot reach 0.78 similarity, so there is no
+/// point measuring them. Bytes are a valid stand-in for characters here, and
+/// the gate is looser than the 0.78 the caller asks for, so it never decides a
+/// match — it only skips work.
+fn plausible(a: &str, b: &str) -> bool {
+    const GATE: f64 = 0.30;
+    let (long, short) = (a.len().max(b.len()), a.len().min(b.len()));
+    long == 0 || (long - short) as f64 / long as f64 <= GATE
 }
 
 /// Find `name` (possibly several words) near the start of `words`,
@@ -112,12 +142,19 @@ pub fn find_name(words: &[String], name: &str, search_window: usize) -> Option<(
 
 /// Percent-encode a query for use in a URL.
 pub fn url_encode(s: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
     let mut out = String::with_capacity(s.len() * 3);
     for b in s.trim().bytes() {
         match b {
             b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => out.push(b as char),
             b' ' => out.push('+'),
-            _ => out.push_str(&format!("%{b:02X}")),
+            // Two characters pushed straight in: `format!` here allocated a
+            // string for every encoded byte of every search query.
+            _ => {
+                out.push('%');
+                out.push(HEX[(b >> 4) as usize] as char);
+                out.push(HEX[(b & 0x0F) as usize] as char);
+            }
         }
     }
     out
@@ -139,6 +176,34 @@ mod tests {
         assert!(app_score("notepad", "Notepad++") > 0.85);
     }
 
+    /// The length gate must only ever skip work, never change a score.
+    #[test]
+    fn the_length_gate_never_changes_a_score() {
+        for (q, c) in [
+            ("chrome", "Google Chrome"),
+            ("vsc", "Visual Studio Code"),
+            ("spotty fi", "Spotify"),
+            ("photoshop", "Adobe Photoshop 2025"),
+            ("notepad", "Notepad++"),
+            ("steam", "Spotify"),
+            ("a", "Zoom Workplace"),
+            ("edge", "Microsoft Edge"),
+            ("discord", "Discord"),
+            ("very long spoken name", "Short"),
+        ] {
+            let full = app_score(q, c);
+            let prepared = app_score_prepared(q, &normalize(c), &squash(c));
+            assert!((full - prepared).abs() < 1e-12, "{q:?} vs {c:?}: {full} != {prepared}");
+        }
+    }
+
+    #[test]
+    fn a_mishearing_is_still_close() {
+        assert!(similarity("this engage", "disengage") > 0.78, "{}", similarity("this engage", "disengage"));
+        // A short phrase against a long sentence is not similar, cheaply.
+        assert_eq!(similarity("stop", "what is the haber process"), 0.0);
+    }
+
     #[test]
     fn name_finding() {
         let w: Vec<String> = "hey no va open chrome".split(' ').map(String::from).collect();
@@ -150,24 +215,35 @@ mod tests {
     #[test]
     fn encoding() {
         assert_eq!(url_encode("what is c++"), "what+is+c%2B%2B");
+        assert_eq!(url_encode("daft punk"), "daft+punk");
+        assert_eq!(url_encode("café"), "caf%C3%A9");
+        assert_eq!(url_encode("  padded  "), "padded");
+        assert_eq!(url_encode("a/b?c#d&e"), "a%2Fb%3Fc%23d%26e");
     }
 }
 
-/// Levenshtein distance between two strings, capped for cheapness.
+/// Levenshtein distance between two strings.
+///
+/// Two things keep this cheap for the wake-word check, which runs it against
+/// every candidate phrase on every command: the rows live in reused buffers
+/// instead of being allocated per call, and the shorter string supplies the row
+/// length, so a two-word phrase compared against a long sentence only ever
+/// costs a two-word row.
 pub fn distance(a: &str, b: &str) -> usize {
-    let (a, b): (Vec<char>, Vec<char>) = (a.chars().collect(), b.chars().collect());
-    if a.is_empty() {
-        return b.len();
-    }
+    // Ordering by byte length is a cheap proxy: `b` ends up as the shorter of
+    // the two, and every character is at least one byte, so the character count
+    // can never exceed it.
+    let (a, b) = if a.len() >= b.len() { (a, b) } else { (b, a) };
+    let b: Vec<char> = b.chars().collect();
     if b.is_empty() {
-        return a.len();
+        return a.chars().count();
     }
     let mut prev: Vec<usize> = (0..=b.len()).collect();
     let mut cur = vec![0usize; b.len() + 1];
-    for (i, ca) in a.iter().enumerate() {
+    for (i, ca) in a.chars().enumerate() {
         cur[0] = i + 1;
         for (j, cb) in b.iter().enumerate() {
-            let cost = usize::from(ca != cb);
+            let cost = usize::from(ca != *cb);
             cur[j + 1] = (prev[j + 1] + 1).min(cur[j] + 1).min(prev[j] + cost);
         }
         std::mem::swap(&mut prev, &mut cur);
@@ -183,6 +259,15 @@ pub fn similarity(a: &str, b: &str) -> f64 {
     let longest = x.chars().count().max(y.chars().count());
     if longest == 0 {
         return 1.0;
+    }
+    // Edit distance is never smaller than the difference in length, so two
+    // strings far apart in size can be rejected without the O(n·m) table.
+    // 0.70 is deliberately looser than the 0.78 the callers ask for: the bound
+    // is only ever used to skip work, never to decide a match.
+    let shortest = x.chars().count().min(y.chars().count());
+    let ceiling = 1.0 - (longest - shortest) as f64 / longest as f64;
+    if ceiling < 0.70 {
+        return 0.0;
     }
     1.0 - distance(&x, &y) as f64 / longest as f64
 }

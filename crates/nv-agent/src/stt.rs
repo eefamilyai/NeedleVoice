@@ -15,61 +15,132 @@ use std::time::Instant;
 use nv_core::config::SttEngine;
 use nv_core::schedule::Stamp;
 use nv_core::Config;
-use sherpa_onnx::{OfflineMoonshineModelConfig, OfflineRecognizer, OfflineRecognizerConfig};
+use sherpa_onnx::{
+    OfflineDolphinModelConfig, OfflineMoonshineModelConfig, OfflineRecognizer, OfflineRecognizerConfig,
+    OfflineSenseVoiceModelConfig,
+};
 use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters, WhisperState};
 
+/// Which recogniser to run. The config offers three user-facing engines; the
+/// rest are here so they can be measured against each other before one is
+/// chosen — see `--bench-stt`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Backend {
+    /// whisper.cpp: multilingual, accurate, slow on a CPU.
+    Whisper,
+    /// sherpa-onnx Moonshine v1 (four ONNX models).
+    Moonshine,
+    /// Moonshine v2: an encoder and a merged decoder, in `.ort` form.
+    Moonshine2,
+    /// SenseVoice: non-autoregressive, so it does not decode token by token.
+    SenseVoice,
+    SenseVoiceNano,
+    /// Dolphin: a small multilingual CTC model.
+    Dolphin,
+}
+
+impl Backend {
+    pub fn name(self) -> &'static str {
+        match self {
+            Backend::Whisper => "whisper",
+            Backend::Moonshine => "moonshine",
+            Backend::Moonshine2 => "moonshine-v2",
+            Backend::SenseVoice => "sensevoice",
+            Backend::SenseVoiceNano => "sensevoice-nano",
+            Backend::Dolphin => "dolphin",
+        }
+    }
+
+    /// Parse a name, for `--bench-stt`.
+    pub fn parse(s: &str) -> Option<Backend> {
+        match s.to_lowercase().replace('_', "-").as_str() {
+            "whisper" => Some(Backend::Whisper),
+            "moonshine" | "moonshine-v1" => Some(Backend::Moonshine),
+            "moonshine-v2" | "moonshine2" => Some(Backend::Moonshine2),
+            "sensevoice" | "sense-voice" => Some(Backend::SenseVoice),
+            "sensevoice-nano" | "sense-voice-nano" | "nano" => Some(Backend::SenseVoiceNano),
+            "dolphin" => Some(Backend::Dolphin),
+            _ => None,
+        }
+    }
+}
+
+/// Whisper is primed with the words this app acts on, so it spells them the way
+/// we expect — "disengage" used to come back as "this engage". Deliberately never
+/// contains "hey <name>": on silence Whisper may echo its prompt, and that must
+/// not wake us.
+fn command_prompt(agent_name: &str) -> String {
+    format!(
+        "{agent_name}. Commands: open Chrome, close Spotify, play music, pause, next track, \
+         volume up, take a screenshot, set an alarm, remind me, never mind, disengage, \
+         cancel that, what time is it, search the web."
+    )
+}
+
 pub struct Stt {
-    engine: SttEngine,
+    backend: Backend,
     threads: i32,
     /// Whisper: the model file, and the prompt that primes its spelling.
     whisper_path: PathBuf,
     prompt: String,
     whisper: Option<(WhisperContext, WhisperState)>,
-    /// Moonshine: sherpa's recogniser, which holds the whole model.
-    moonshine: Option<OfflineRecognizer>,
+    /// Every sherpa-onnx engine loads into the same recogniser type.
+    sherpa: Option<OfflineRecognizer>,
     /// Save each clip for later inspection.
     save_clips: bool,
     last_used: Instant,
 }
 
 impl Stt {
-    /// Build a recogniser for this config. Moonshine is used when it was asked
-    /// for and its files are on disk; otherwise this falls back to Whisper with
-    /// a line in the log saying why.
+    /// Build a recogniser for this config, honouring the engine choice and
+    /// falling back to whatever will actually run.
     pub fn new(cfg: &Config) -> Self {
-        let mut engine = cfg.stt_engine;
         let whisper_path = nv_core::whisper_model_path(&cfg.whisper_model);
-        if engine == SttEngine::Moonshine && !nv_core::moonshine_installed() {
-            log::warn!(
-                "Moonshine files are not in {} — using Whisper until they are downloaded",
-                nv_core::moonshine_dir().display()
-            );
-            engine = SttEngine::Whisper;
-        }
-        // And the other way round: a chosen Whisper model that was never
-        // downloaded shouldn't leave the assistant unable to hear anything.
-        if engine == SttEngine::Whisper && !whisper_path.exists() && nv_core::moonshine_installed() {
+        let mut backend = match cfg.stt_engine {
+            SttEngine::Moonshine => {
+                if !nv_core::moonshine_installed() {
+                    log::warn!(
+                        "Moonshine files are not in {} — using Whisper until they are downloaded",
+                        nv_core::moonshine_dir().display()
+                    );
+                    Backend::Whisper
+                } else if nv_core::moonshine_v2_installed() {
+                    Backend::Moonshine2
+                } else {
+                    Backend::Moonshine
+                }
+            }
+            SttEngine::Whisper => Backend::Whisper,
+            SttEngine::SenseVoice => Backend::SenseVoice,
+        };
+        // A chosen model that was never downloaded shouldn't leave the assistant
+        // unable to hear anything.
+        if backend == Backend::Whisper && !whisper_path.exists() && nv_core::moonshine_installed() {
             log::warn!("Whisper model {} is missing — using Moonshine", whisper_path.display());
-            engine = SttEngine::Moonshine;
+            backend = Backend::Moonshine;
         }
-        // Priming Whisper with the name and the words this app actually acts on
-        // makes it spell them consistently — "disengage" used to come back as
-        // "this engage". The prompt deliberately never contains "hey <name>": on
-        // silence Whisper may echo its prompt, and that must not wake us.
-        let prompt = format!(
-            "{}. Commands: open Chrome, close Spotify, play music, pause, next track, \
-             volume up, take a screenshot, set an alarm, remind me, never mind, disengage, \
-             cancel that, what time is it, search the web.",
-            cfg.agent_name
-        );
         Stt {
-            engine,
+            backend,
             threads: cfg.threads as i32,
             whisper_path,
-            prompt,
+            prompt: command_prompt(&cfg.agent_name),
             whisper: None,
-            moonshine: None,
+            sherpa: None,
             save_clips: cfg.save_clips,
+            last_used: Instant::now(),
+        }
+    }
+
+    /// A specific engine, for the benchmark and the pipeline tests.
+    pub fn with(backend: Backend, threads: u32, agent_name: &str, whisper_model: &str) -> Self {
+        Stt {
+            backend,
+            threads: threads as i32,
+            whisper_path: nv_core::whisper_model_path(whisper_model),
+            prompt: command_prompt(agent_name),
+            whisper: None,
+            sherpa: None,
+            save_clips: false,
             last_used: Instant::now(),
         }
     }
@@ -77,48 +148,25 @@ impl Stt {
     /// A Whisper recogniser for a specific model file, whatever the config says.
     /// The benchmark command and the pipeline tests need this.
     pub fn whisper(path: PathBuf, threads: u32, agent_name: &str) -> Self {
-        let mut stt = Stt {
-            engine: SttEngine::Whisper,
-            threads: threads as i32,
-            whisper_path: path,
-            prompt: String::new(),
-            whisper: None,
-            moonshine: None,
-            save_clips: false,
-            last_used: Instant::now(),
-        };
-        stt.prompt = format!(
-            "{agent_name}. Commands: open Chrome, close Spotify, play music, pause, next track, \
-             volume up, take a screenshot, set an alarm, remind me, never mind, disengage, \
-             cancel that, what time is it, search the web."
-        );
+        let mut stt = Stt::with(Backend::Whisper, threads, agent_name, "");
+        stt.whisper_path = path;
         stt
     }
 
-    /// A Moonshine recogniser, whatever the config says.
-    pub fn moonshine(threads: u32) -> Self {
-        Stt {
-            engine: SttEngine::Moonshine,
-            threads: threads as i32,
-            whisper_path: PathBuf::new(),
-            prompt: String::new(),
-            whisper: None,
-            moonshine: None,
-            save_clips: false,
-            last_used: Instant::now(),
-        }
+    pub fn backend(&self) -> Backend {
+        self.backend
     }
 
     /// Which engine this instance actually ended up with.
-    pub fn engine(&self) -> SttEngine {
-        self.engine
+    pub fn engine(&self) -> &'static str {
+        self.backend.name()
     }
 
     /// Is the model in memory already?
     pub fn loaded(&self) -> bool {
-        match self.engine {
-            SttEngine::Moonshine => self.moonshine.is_some(),
-            SttEngine::Whisper => self.whisper.is_some(),
+        match self.backend {
+            Backend::Whisper => self.whisper.is_some(),
+            _ => self.sherpa.is_some(),
         }
     }
 
@@ -132,66 +180,104 @@ impl Stt {
 
     /// Load whatever is needed, if it is not loaded already.
     fn ensure(&mut self) -> Result<(), String> {
-        match self.engine {
-            SttEngine::Moonshine => {
-                if self.moonshine.is_none() {
-                    let t = Instant::now();
-                    let dir = nv_core::moonshine_dir();
-                    let file = |name: &str| Some(dir.join(name).to_string_lossy().to_string());
-                    let mut config = OfflineRecognizerConfig::default();
-                    config.model_config.moonshine = OfflineMoonshineModelConfig {
-                        preprocessor: file("preprocess.onnx"),
-                        encoder: file("encode.int8.onnx"),
-                        uncached_decoder: file("uncached_decode.int8.onnx"),
-                        cached_decoder: file("cached_decode.int8.onnx"),
-                        merged_decoder: None,
-                    };
-                    config.model_config.tokens = file("tokens.txt");
-                    config.model_config.num_threads = self.threads;
-                    config.model_config.provider = Some("cpu".to_string());
-                    config.decoding_method = Some("greedy_search".to_string());
-                    let recognizer = OfflineRecognizer::create(&config)
-                        .ok_or_else(|| format!("could not load Moonshine from {}", dir.display()))?;
-                    log::info!("Moonshine loaded in {:?}", t.elapsed());
-                    self.moonshine = Some(recognizer);
-                }
+        if self.backend == Backend::Whisper {
+            if self.whisper.is_none() {
+                let t = Instant::now();
+                // `--features cuda` (or vulkan) builds the GPU backend in;
+                // without it this is a CPU build and asking for the GPU would
+                // just fail.
+                let mut params = WhisperContextParameters::default();
+                params.use_gpu(cfg!(feature = "gpu"));
+                // Measured on a Ryzen 5 2600: flash attention is 1.5× *slower* on
+                // this CPU (0.97 s vs 0.65 s per clip with base.en).
+                params.flash_attn(false);
+                let ctx = WhisperContext::new_with_params(&self.whisper_path, params)
+                    .map_err(|e| format!("could not load Whisper model {}: {e}", self.whisper_path.display()))?;
+                let state = ctx.create_state().map_err(|e| e.to_string())?;
+                log::info!("Whisper loaded in {:?}", t.elapsed());
+                self.whisper = Some((ctx, state));
             }
-            SttEngine::Whisper => {
-                if self.whisper.is_none() {
-                    let t = Instant::now();
-                    // `--features cuda` (or vulkan) builds the GPU backend in;
-                    // without it this is a CPU build and asking for the GPU would
-                    // just fail.
-                    let mut params = WhisperContextParameters::default();
-                    params.use_gpu(cfg!(feature = "gpu"));
-                    // Measured on a Ryzen 5 2600: flash attention is 1.5× *slower*
-                    // on this CPU (0.97 s vs 0.65 s per clip with base.en).
-                    params.flash_attn(false);
-                    let ctx = WhisperContext::new_with_params(&self.whisper_path, params)
-                        .map_err(|e| format!("could not load Whisper model {}: {e}", self.whisper_path.display()))?;
-                    let state = ctx.create_state().map_err(|e| e.to_string())?;
-                    log::info!("Whisper loaded in {:?}", t.elapsed());
-                    self.whisper = Some((ctx, state));
-                }
-            }
+            return Ok(());
+        }
+        if self.sherpa.is_none() {
+            let t = Instant::now();
+            let config = self.sherpa_config()?;
+            let recognizer = OfflineRecognizer::create(&config)
+                .ok_or_else(|| format!("could not load the {} model", self.backend.name()))?;
+            log::info!("{} loaded in {:?}", self.backend.name(), t.elapsed());
+            self.sherpa = Some(recognizer);
         }
         Ok(())
+    }
+
+    /// The model paths for whichever sherpa-onnx engine is selected.
+    fn sherpa_config(&self) -> Result<OfflineRecognizerConfig, String> {
+        let mut config = OfflineRecognizerConfig::default();
+        config.model_config.num_threads = self.threads;
+        config.model_config.provider = Some("cpu".to_string());
+        config.decoding_method = Some("greedy_search".to_string());
+        let models = nv_core::paths::models_dir();
+        let path = |p: std::path::PathBuf| Some(p.to_string_lossy().to_string());
+        match self.backend {
+            Backend::Moonshine => {
+                let dir = models.join("moonshine").join(nv_core::MOONSHINE_PACKS[0]);
+                config.model_config.moonshine = OfflineMoonshineModelConfig {
+                    preprocessor: path(dir.join("preprocess.onnx")),
+                    encoder: path(dir.join("encode.int8.onnx")),
+                    uncached_decoder: path(dir.join("uncached_decode.int8.onnx")),
+                    cached_decoder: path(dir.join("cached_decode.int8.onnx")),
+                    merged_decoder: None,
+                };
+                config.model_config.tokens = path(dir.join("tokens.txt"));
+            }
+            Backend::Moonshine2 => {
+                // v2: an encoder and a merged decoder, in ONNX Runtime format.
+                let dir = nv_core::moonshine_v2_dir();
+                config.model_config.moonshine = OfflineMoonshineModelConfig {
+                    preprocessor: None,
+                    encoder: path(dir.join("encoder_model.ort")),
+                    uncached_decoder: None,
+                    cached_decoder: None,
+                    merged_decoder: path(dir.join("decoder_model_merged.ort")),
+                };
+                config.model_config.tokens = path(dir.join("tokens.txt"));
+            }
+            Backend::SenseVoice | Backend::SenseVoiceNano => {
+                let pack = if self.backend == Backend::SenseVoice {
+                    nv_core::SENSEVOICE_PACK
+                } else {
+                    nv_core::SENSEVOICE_NANO_PACK
+                };
+                let dir = models.join("sensevoice").join(pack);
+                config.model_config.sense_voice = OfflineSenseVoiceModelConfig {
+                    model: path(dir.join("model.int8.onnx")),
+                    language: Some("en".to_string()),
+                    use_itn: true,
+                };
+                config.model_config.tokens = path(dir.join("tokens.txt"));
+            }
+            Backend::Dolphin => {
+                let dir = models.join("dolphin").join(nv_core::DOLPHIN_PACK);
+                config.model_config.dolphin = OfflineDolphinModelConfig {
+                    model: path(dir.join("model.int8.onnx")),
+                };
+                config.model_config.tokens = path(dir.join("tokens.txt"));
+            }
+            Backend::Whisper => return Err("Whisper does not use the sherpa path".into()),
+        }
+        Ok(config)
     }
 
     pub fn unload_if_idle(&mut self, idle: std::time::Duration) {
         if self.last_used.elapsed() < idle {
             return;
         }
-        match self.engine {
-            SttEngine::Whisper if self.whisper.is_some() => {
-                self.whisper = None;
+        if self.backend == Backend::Whisper {
+            if self.whisper.take().is_some() {
                 log::info!("Whisper unloaded (idle)");
             }
-            SttEngine::Moonshine if self.moonshine.is_some() => {
-                self.moonshine = None;
-                log::info!("Moonshine unloaded (idle)");
-            }
-            _ => {}
+        } else if self.sherpa.take().is_some() {
+            log::info!("{} unloaded (idle)", self.backend.name());
         }
     }
 
@@ -205,63 +291,62 @@ impl Stt {
         self.ensure()?;
         let load = load_started.elapsed();
         let infer_started = Instant::now();
-        let text = match self.engine {
-            SttEngine::Moonshine => self.run_moonshine(audio)?,
-            SttEngine::Whisper => self.run_whisper(audio)?,
+        let text = match self.backend {
+            Backend::Whisper => self.run_whisper(audio)?,
+            _ => self.run_sherpa(audio)?,
         };
         let infer = infer_started.elapsed();
-        // `NV_DUMP_AUDIO=<dir>` writes what the recogniser was given. Guessing
-        // at a mis-heard word is hopeless; having the clip is not.
-        let dump_dir = std::env::var("NV_DUMP_AUDIO").ok().map(std::path::PathBuf::from).or_else(|| {
-            self.save_clips.then(|| nv_core::paths::data_dir().join("clips"))
-        });
-        if let Some(dir) = dump_dir {
-            let dir = dir.display().to_string();
-            let peak = audio.iter().fold(0f32, |m, s| m.max(s.abs()));
-            let rms = (audio.iter().map(|s| s * s).sum::<f32>() / audio.len().max(1) as f32).sqrt();
-            let path = std::path::Path::new(&dir).join(format!(
-                "cmd-{}-{:.0}ms-peak{:.0}db.wav",
-                Stamp::now().clock().replace(':', ""),
-                audio.len() as f32 / crate::audio::RATE as f32 * 1000.0,
-                20.0 * peak.max(1e-9).log10()
-            ));
-            if std::fs::create_dir_all(&dir).is_ok() {
-                let _ = write_wav(&path, audio);
-                log::info!(
-                    "audio dumped to {} (peak {:.0} dBFS, rms {:.0} dBFS)",
-                    path.display(),
-                    20.0 * peak.max(1e-9).log10(),
-                    20.0 * rms.max(1e-9).log10()
-                );
-            }
-        }
+        self.dump_if_wanted(audio);
         if cold {
-            log::info!("{}: {:.0} ms infer + {:.0} ms load (cold)", self.engine.label(), infer.as_secs_f32() * 1000.0, load.as_secs_f32() * 1000.0);
+            log::info!(
+                "{}: {:.0} ms infer + {:.0} ms load (cold)",
+                self.backend.name(),
+                infer.as_secs_f32() * 1000.0,
+                load.as_secs_f32() * 1000.0
+            );
         } else {
-            log::info!("{}: {:.0} ms infer", self.engine.label(), infer.as_secs_f32() * 1000.0);
+            log::info!("{}: {:.0} ms infer", self.backend.name(), infer.as_secs_f32() * 1000.0);
         }
         self.last_used = Instant::now();
         Ok(clean(&text))
     }
 
-    /// Moonshine takes the whole clip at once, which is exactly what a command is.
-    fn run_moonshine(&mut self, audio: &[f32]) -> Result<String, String> {
-        let recognizer = self.moonshine.as_ref().ok_or("Moonshine is not loaded")?;
-        let stream = recognizer.create_stream();
-        // Same levelling as Whisper gets: a soft first syllable on a quiet
-        // microphone is the most likely word to go missing, and this is the
-        // cheapest thing that helps it.
-        let mut data = normalize(audio);
-        // A little leading silence, and enough audio to be worth recognising.
-        let mut padded = vec![0.0f32; crate::audio::RATE as usize / 16];
-        padded.extend_from_slice(&data);
-        if padded.len() < crate::audio::RATE as usize / 2 {
-            padded.resize(crate::audio::RATE as usize / 2, 0.0);
+    /// `NV_DUMP_AUDIO=<dir>`, or the "Save what it hears" setting, writes the
+    /// clip the recogniser was given. Guessing at a mis-heard word is hopeless;
+    /// having the clip is not.
+    fn dump_if_wanted(&self, audio: &[f32]) {
+        let dir = std::env::var("NV_DUMP_AUDIO")
+            .ok()
+            .map(std::path::PathBuf::from)
+            .or_else(|| self.save_clips.then(|| nv_core::paths::data_dir().join("clips")));
+        let Some(dir) = dir else { return };
+        let peak = audio.iter().fold(0f32, |m, s| m.max(s.abs()));
+        let rms = (audio.iter().map(|s| s * s).sum::<f32>() / audio.len().max(1) as f32).sqrt();
+        let stamp = Stamp::now().clock().replace(':', "");
+        let ms = audio.len() as f32 / crate::audio::RATE as f32 * 1000.0;
+        let path = dir.join(format!("cmd-{stamp}-{ms:.0}ms.wav"));
+        if std::fs::create_dir_all(&dir).is_ok() {
+            let _ = write_wav(&path, audio);
+            log::info!(
+                "audio dumped to {} (peak {:.0} dBFS, rms {:.0} dBFS)",
+                path.display(),
+                20.0 * peak.max(1e-9).log10(),
+                20.0 * rms.max(1e-9).log10()
+            );
         }
-        data = padded;
+    }
+
+    /// Any sherpa-onnx engine: hand it the clip, take the text.
+    fn run_sherpa(&mut self, audio: &[f32]) -> Result<String, String> {
+        let recognizer = self.sherpa.as_ref().ok_or("the model is not loaded")?;
+        let stream = recognizer.create_stream();
+        // Levelling and both pads in one allocation, the same treatment Whisper
+        // gets: a soft first syllable on a quiet microphone is the one most
+        // likely to go missing.
+        let data = normalize_padded(audio, crate::audio::RATE as usize / 16, crate::audio::RATE as usize / 2);
         stream.accept_waveform(crate::audio::RATE as i32, &data);
         recognizer.decode(&stream);
-        let result = stream.get_result().ok_or("Moonshine returned nothing")?;
+        let result = stream.get_result().ok_or("the model returned nothing")?;
         Ok(result.text)
     }
 
@@ -294,10 +379,7 @@ impl Stt {
         p.set_audio_ctx(ctx);
 
         // Level the clip (quiet mics) and pad to the ~1 s Whisper needs.
-        let mut data = normalize(audio);
-        if data.len() < crate::audio::RATE as usize + 1600 {
-            data.resize(crate::audio::RATE as usize + 1600, 0.0);
-        }
+        let data = normalize_padded(audio, 0, crate::audio::RATE as usize + 1600);
         state.full(p, &data).map_err(|e| e.to_string())?;
         let mut text = String::new();
         for seg in state.as_iter() {
@@ -331,10 +413,13 @@ pub fn write_wav_at(path: &std::path::Path, samples: &[f32], rate: u32) -> std::
     f.write_all(&16u16.to_le_bytes())?;
     f.write_all(b"data")?;
     f.write_all(&data_len.to_le_bytes())?;
-    for s in samples {
-        let v = (s.clamp(-1.0, 1.0) * 32767.0) as i16;
-        f.write_all(&v.to_le_bytes())?;
-    }
+    // One conversion and one write: a per-sample `write_all` was tens of
+    // thousands of tiny calls for a dumped command clip.
+    let pcm: Vec<u8> = samples
+        .iter()
+        .flat_map(|s| ((s.clamp(-1.0, 1.0) * 32767.0) as i16).to_le_bytes())
+        .collect();
+    f.write_all(&pcm)?;
     f.flush()
 }
 
@@ -354,28 +439,40 @@ fn clean(s: &str) -> String {
     dedupe_sentences(&out)
 }
 
-/// With a shortened audio context Whisper sometimes lo
-
 /// With a shortened audio context Whisper sometimes loops ("Open Chrome.
-/// Open Chrome. Open Chrome."). Keep sentences until one repeats.
+/// Open Chrome. Open Chrome.").
+///
+/// A sentence that repeats the one before it is a stutter and is dropped; a
+/// sentence that repeats an *earlier* one is not, and neither is a trailing
+/// fragment that merely starts with an earlier sentence's words — cutting the
+/// output off at the first repeat is how a real command ("Open Chrome. Open
+/// Chrome. And search for trains.") lost everything after the stutter.
 fn dedupe_sentences(s: &str) -> String {
-    let mut seen: Vec<String> = Vec::new();
     let mut out = String::new();
+    let mut previous: Option<String> = None;
     let mut start = 0;
     for (i, c) in s.char_indices() {
         let end = i + c.len_utf8();
-        if matches!(c, '.' | '?' | '!') || end == s.len() {
-            let sentence = &s[start..end];
-            let key = nv_core::fuzzy::normalize(sentence);
-            if !key.is_empty() {
-                if seen.iter().any(|k| k == &key || (end == s.len() && k.starts_with(&key))) {
-                    break;
-                }
-                seen.push(key);
-            }
-            out.push_str(sentence);
-            start = end;
+        if !matches!(c, '.' | '?' | '!') && end != s.len() {
+            continue;
         }
+        let sentence = &s[start..end];
+        start = end;
+        let key = nv_core::fuzzy::normalize(sentence);
+        if key.is_empty() {
+            out.push_str(sentence);
+            continue;
+        }
+        if previous.as_deref() == Some(key.as_str()) {
+            continue; // a stutter, not a second request
+        }
+        // A trailing fragment can come back as the beginning of the sentence
+        // that preceded it; that is the same stutter, heard mid-loop.
+        if end == s.len() && previous.as_deref().is_some_and(|p| p.starts_with(&key)) {
+            continue;
+        }
+        previous = Some(key);
+        out.push_str(sentence);
     }
     out.trim().to_string()
 }
@@ -387,13 +484,51 @@ mod tests {
         assert_eq!(super::clean("Hey Nova, open Chrome. Hey Nova, open Chrome. Hey"), "Hey Nova, open Chrome.");
         assert_eq!(super::clean("[BLANK_AUDIO]"), "");
         assert_eq!(super::clean("What is it? Tell me."), "What is it? Tell me.");
+        assert_eq!(super::clean("(music) open chrome"), "open chrome");
+    }
+
+    /// A stutter in the middle of a sentence must not throw away the rest of it.
+    #[test]
+    fn a_looping_transcript_keeps_what_follows() {
+        assert_eq!(
+            super::clean("Open Chrome. Open Chrome. And search for trains."),
+            "Open Chrome. And search for trains."
+        );
+        // A genuine second sentence with the same opening is not a stutter.
+        assert_eq!(
+            super::clean("Open Chrome. Open Spotify."),
+            "Open Chrome. Open Spotify."
+        );
+        // Repeating something from earlier is a repeat, not a loop to be cut.
+        assert_eq!(super::clean("Set a timer. Get coffee. Set a timer."), "Set a timer. Get coffee. Set a timer.");
+    }
+
+    #[test]
+    fn padding_and_levelling_happen_together() {
+        let quiet = super::normalize_padded(&[0.05, -0.05], 100, 50);
+        assert_eq!(quiet.len(), 102);
+        assert!(quiet[..100].iter().all(|s| *s == 0.0));
+        // Levelled to the 0.5 peak target, not beyond it.
+        assert!((quiet[100] - 0.5).abs() < 1e-6, "{}", quiet[100]);
+        assert!((quiet[101] + 0.5).abs() < 1e-6, "{}", quiet[101]);
+        let short = super::normalize_padded(&[0.5], 0, 400);
+        assert_eq!(short.len(), 400);
+        assert!(short[1..].iter().all(|s| *s == 0.0));
+        // Silence stays silent: there is nothing to level up.
+        assert!(super::normalize_padded(&[0.0; 8], 0, 0).iter().all(|s| *s == 0.0));
     }
 }
 
 /// Boost quiet speech so its peak sits around -6 dBFS (at most +26 dB, so
-/// pure hiss isn't blown up into "words").
-pub fn normalize(audio: &[f32]) -> Vec<f32> {
+/// pure hiss isn't blown up into "words"), with `lead` silent samples in front
+/// and the result padded out to at least `least` samples — all in one
+/// allocation, since every recogniser wants both.
+pub fn normalize_padded(audio: &[f32], lead: usize, least: usize) -> Vec<f32> {
     let peak = audio.iter().fold(0f32, |m, s| m.max(s.abs()));
     let gain = if peak > 1e-6 { (0.5 / peak).clamp(1.0, 20.0) } else { 1.0 };
-    audio.iter().map(|s| (s * gain).clamp(-1.0, 1.0)).collect()
+    let mut out = Vec::with_capacity((lead + audio.len()).max(least));
+    out.resize(lead, 0.0);
+    out.extend(audio.iter().map(|s| (s * gain).clamp(-1.0, 1.0)));
+    out.resize(out.len().max(least), 0.0);
+    out
 }

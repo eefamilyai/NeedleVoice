@@ -135,16 +135,6 @@ pub fn has_icons() -> bool {
     HAS_ICONS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-/// An icon glyph, or `""` when no icon font is installed (the caller then falls
-/// back to a text label, so nothing renders as an empty box).
-pub fn icon(glyph: &str) -> String {
-    if has_icons() {
-        glyph.to_string()
-    } else {
-        String::new()
-    }
-}
-
 /// Segoe UI for text, Segoe Fluent Icons (or MDL2) for glyphs, with the Windows
 /// symbol and emoji fonts behind them for anything neither covers.
 pub fn install_fonts(ctx: &egui::Context) {
@@ -401,6 +391,7 @@ pub fn glyph(ui: &mut Ui, glyph: &str, size: f32, colour: Color32) {
 }
 
 /// An icon in a rounded square, for cards and empty states.
+#[allow(dead_code)]
 pub fn glyph_tile(ui: &mut Ui, glyph: &str, colour: Color32, size: f32) {
     let t = theme(ui);
     let (rect, _) = ui.allocate_exact_size(Vec2::splat(size), Sense::hover());
@@ -416,6 +407,11 @@ pub fn glyph_tile(ui: &mut Ui, glyph: &str, colour: Color32, size: f32) {
 }
 
 /// An empty state: icon, headline, one line of explanation.
+///
+/// Nothing draws one today — every page has content to show — but it is the
+/// shape the next "you have not set this up yet" page wants, and the test below
+/// keeps it working.
+#[allow(dead_code)]
 pub fn empty(ui: &mut Ui, glyph_text: &str, title: &str, body: &str) {
     let t = theme(ui);
     ui.vertical_centered(|ui| {
@@ -500,6 +496,19 @@ pub fn primary(ui: &mut Ui, text: &str, enabled: bool) -> Response {
     .corner_radius(CornerRadius::same(9))
     .min_size(Vec2::new(0.0, 30.0));
     ui.add_enabled(enabled, button)
+}
+
+/// A normal button: visible at rest, so it does not have to be found by
+/// hovering over it.
+#[allow(dead_code)]
+pub fn button(ui: &mut Ui, text: &str) -> Response {
+    let t = theme(ui);
+    let button = egui::Button::new(RichText::new(text).size(13.0).color(t.text))
+        .fill(t.inset)
+        .stroke(Stroke::new(1.0, t.border_strong))
+        .corner_radius(CornerRadius::same(9))
+        .min_size(Vec2::new(0.0, 30.0));
+    ui.add(button)
 }
 
 /// A quiet button: no fill until hovered.
@@ -674,27 +683,69 @@ pub fn resize_edges(ui: &mut Ui) {
 }
 
 // ── icon glyphs (Segoe Fluent Icons / MDL2 Assets) ───────────────────────
-pub const ICON_SETTINGS: &str = "\u{E713}";
-pub const ICON_MIC: &str = "\u{E720}";
-pub const ICON_VOLUME: &str = "\u{E767}";
-pub const ICON_SPARKLE: &str = "\u{E945}";
-pub const ICON_GLOBE: &str = "\u{E774}";
-pub const ICON_APPS: &str = "\u{E71D}";
-pub const ICON_CALENDAR: &str = "\u{E787}";
-pub const ICON_TEST: &str = "\u{E9D9}";
+// Only the glyphs something draws are named here. The navigation column carries
+// its own, next to the label each one belongs to; add another by name when a
+// page needs one, rather than keeping a list nothing reads.
 pub const ICON_CHECK: &str = "\u{E73E}";
 pub const ICON_DELETE: &str = "\u{E74D}";
-pub const ICON_SAVE: &str = "\u{E74E}";
-pub const ICON_DOWNLOAD: &str = "\u{E896}";
-pub const ICON_FOLDER: &str = "\u{E8B7}";
-pub const ICON_PLAY: &str = "\u{E768}";
-pub const ICON_REFRESH: &str = "\u{E72C}";
 pub const ICON_CHEVRON_RIGHT: &str = "\u{E76C}";
 pub const ICON_SEARCH: &str = "\u{E721}";
 pub const ICON_MINIMIZE: &str = "\u{E921}";
 pub const ICON_MAXIMIZE: &str = "\u{E922}";
 pub const ICON_RESTORE: &str = "\u{E923}";
 pub const ICON_CLOSE: &str = "\u{E8BB}";
-pub const ICON_ROBOT: &str = "\u{E99A}";
-pub const ICON_PUZZLE: &str = "\u{EA86}";
-pub const ICON_ALERT: &str = "\u{E7BA}";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// One frame of a UI, so the drawing helpers can be exercised without a
+    /// window. Nothing here inspects pixels; it is a smoke test that the shared
+    /// widgets lay out and paint without panicking.
+    fn frame(ui_fn: impl FnOnce(&mut Ui)) {
+        let ctx = egui::Context::default();
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0))),
+            ..Default::default()
+        };
+        let mut f = Some(ui_fn);
+        let mut out = ctx.run_ui(input, |ui| {
+            set(ui.ctx(), Theme::default());
+            if let Some(f) = f.take() {
+                f(ui);
+            }
+        });
+        out.textures_delta.clear();
+    }
+
+    #[test]
+    fn the_shared_widgets_draw() {
+        frame(|ui| {
+            empty(ui, ICON_SEARCH, "Nothing here", "Add one to get started.");
+            let _ = button(ui, "Add");
+            let _ = pill(ui, "installed", Color32::GREEN);
+            dot(ui, Color32::RED, 7.0);
+            glyph(ui, ICON_SEARCH, 12.0, Color32::WHITE);
+            glyph_tile(ui, ICON_SEARCH, Color32::WHITE, 44.0);
+            divider(ui);
+            let mut on = false;
+            let _ = switch(ui, &mut on, "on");
+            let mut value = 1u8;
+            assert!(!segmented(ui, &mut value, &[(1u8, "one"), (2u8, "two")]));
+        });
+    }
+
+    /// Light and dark are separate palettes, and the accent decides what is
+    /// readable on top of it.
+    #[test]
+    fn the_palette_is_consistent() {
+        for dark in [true, false] {
+            let t = Theme::new(dark, Color32::from_rgb(0xB6, 0xFF, 0x2E));
+            assert_eq!(t.dark, dark);
+            // A bright accent takes dark text on top of it, and vice versa.
+            assert!(luminance(t.on_accent) < 0.5 || luminance(t.accent) < 0.5);
+            assert_ne!(t.text, t.bg, "text must not match the background");
+            assert_ne!(t.surface, t.inset, "surfaces must be distinguishable");
+        }
+    }
+}

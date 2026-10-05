@@ -11,13 +11,21 @@ pub struct Mic {
     pub rx: Receiver<Vec<f32>>,
 }
 
+/// Is this the hands-free half of a Bluetooth headset? Windows lists both halves:
+/// "Headphones (X)" is the good-sounding one, "Headset (X)" and
+/// "Headset (X Hands-Free)" are the telephone-quality one that carries the mic.
+fn looks_like_handsfree(name: &str) -> bool {
+    let n = name.to_lowercase();
+    n.contains("hands-free") || n.contains("handsfree") || n.starts_with("headset") || n.contains("(headset")
+}
+
 fn device_name(d: &cpal::Device) -> String {
     d.description().map(|d| d.name().to_string()).unwrap_or_default()
 }
 
 impl Mic {
     /// Open `name`, or the Windows default microphone when empty / not found.
-    pub fn open(name: &str) -> Result<Mic, String> {
+    pub fn open(name: &str, avoid_handsfree: bool) -> Result<Mic, String> {
         // Dev/testing: NV_FAKE_MIC=<16 kHz mono wav> plays a file in real time, then silence.
         if let Some(path) = std::env::var_os("NV_FAKE_MIC") {
             let bytes = std::fs::read(&path).map_err(|e| e.to_string())?;
@@ -41,13 +49,51 @@ impl Mic {
             return Ok(Mic { _streams: Vec::new(), rx });
         }
         let host = cpal::default_host();
-        if !name.is_empty() {
-            if let Some(d) = host.input_devices().ok().and_then(|mut it| it.find(|d| device_name(d) == name)) {
-                return Self::open_device(d);
-            }
-            log::warn!("microphone \"{name}\" not found, using the Windows default");
+        let devices: Vec<cpal::Device> = host.input_devices().map(|it| it.collect()).unwrap_or_default();
+        let chosen = if name.is_empty() {
+            None
+        } else {
+            devices
+                .iter()
+                .find(|d| device_name(d) == name)
+                .or_else(|| devices.iter().find(|d| device_name(d).eq_ignore_ascii_case(name)))
+                .or_else(|| {
+                    devices.iter().find(|d| {
+                        let have = device_name(d).to_lowercase();
+                        let want = name.to_lowercase();
+                        have.contains(&want) || want.contains(&have)
+                    })
+                })
+        };
+        if chosen.is_none() && !name.is_empty() {
+            log::warn!("microphone \"{name}\" is not connected; falling back");
         }
-        Self::open_device(host.default_input_device().ok_or("no microphone found")?)
+        let device = match chosen {
+            Some(d) => d.clone(),
+            None => host.default_input_device().ok_or("no microphone found")?,
+        };
+
+        // A Bluetooth headset's microphone only exists in hands-free mode, and
+        // opening it switches the whole headset to that: mono, 16 kHz, telephone
+        // quality — for playback too, and for as long as we hold the microphone
+        // open, which is always. A separate microphone avoids the whole thing.
+        let name_used = device_name(&device);
+        let hands_free = looks_like_handsfree(&name_used);
+        if hands_free && avoid_handsfree {
+            if let Some(better) = devices.iter().find(|d| !looks_like_handsfree(&device_name(d))) {
+                let better_name = device_name(better);
+                log::warn!(
+                    "using \"{better_name}\" instead of \"{name_used}\": a Bluetooth hands-free                      microphone switches the headset to mono telephone quality while it is open"
+                );
+                return Self::open_device(better.clone());
+            }
+            log::info!(
+                "\"{name_used}\" is a Bluetooth headset microphone: while the assistant listens \
+                 the headset plays in mono, telephone quality. Settings > Listening can use \
+                 another microphone instead if you would rather keep the sound."
+            );
+        }
+        Self::open_device(device)
     }
 
     fn open_device(device: cpal::Device) -> Result<Mic, String> {

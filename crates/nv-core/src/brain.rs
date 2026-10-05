@@ -416,12 +416,24 @@ pub fn parse_calls(json: &str, cfg: &Config) -> Vec<Action> {
     out
 }
 
+/// Does this read as a web address rather than an app name? True for "reddit.com"
+/// and for a path on one, "youtube.com/watch?v=…".
 pub fn looks_like_domain(s: &str) -> bool {
     let s = s.trim().to_lowercase();
-    !s.contains(' ')
-        && [".com", ".org", ".net", ".io", ".dev", ".ai", ".gg", ".tv", ".co", ".edu", ".gov", ".uk", ".app"]
-            .iter()
-            .any(|tld| s.ends_with(tld) || s.contains(&format!("{tld}/")))
+    if s.contains(' ') {
+        return false;
+    }
+    // The "…/path" form is matched by eye, without building a string per
+    // top-level domain on every call.
+    const TLDS: [&str; 13] =
+        [".com", ".org", ".net", ".io", ".dev", ".ai", ".gg", ".tv", ".co", ".edu", ".gov", ".uk", ".app"];
+    TLDS.iter().any(|tld| {
+        s.ends_with(tld)
+            || s.find(tld).is_some_and(|at| {
+                let rest = &s[at + tld.len()..];
+                rest.starts_with('/') || rest.starts_with('?')
+            })
+    })
 }
 
 /// Is this function switched on? The instant paths have to check, or a
@@ -472,42 +484,60 @@ const LEADING_FILLER: &[&str] = &[
 
 /// Strip politeness, filler at either end, the assistant's own name, and the
 /// punctuation Whisper adds.
+///
+/// The comparisons are made byte by byte rather than by lowercasing the whole
+/// command once per filler word, which was building a fresh String for every
+/// one of them on every pass.
 fn clean_command(s: &str, cfg: &Config) -> String {
     // Commas are punctuation, not content: "hey, never mind".
     let mut c = s.trim().trim_end_matches(['.', '!', '?', ',']).replace(',', " ").trim().to_string();
     let prefixes: Vec<String> = cfg.wake_prefixes.iter().map(|p| fuzzy::normalize(p)).collect();
     // Leading "actually" / "hey" / "please".
     loop {
-        let before = c.clone();
-        let lower = c.to_lowercase();
-        for p in LEADING_FILLER.iter().map(|p| p.to_string()).chain(prefixes.iter().cloned()) {
-            if lower.len() > p.len() + 1 && lower.starts_with(&p) && lower.as_bytes()[p.len()] == b' ' {
-                c = c[p.len() + 1..].to_string();
-                break;
-            }
-        }
-        if c == before {
-            break;
+        let strip = LEADING_FILLER
+            .iter()
+            .copied()
+            .chain(prefixes.iter().map(String::as_str))
+            .find_map(|p| strip_leading_word(&c, p));
+        match strip {
+            Some(rest) => c = rest.to_string(),
+            None => break,
         }
     }
     let names: Vec<String> = cfg.wake_names().iter().map(|n| fuzzy::normalize(n)).collect();
     loop {
-        let before = c.clone();
-        let lower = c.to_lowercase();
-        for f in TRAILING_FILLER.iter().map(|f| f.to_string()).chain(names.iter().cloned()) {
-            if lower.len() > f.len() && lower.ends_with(&f) {
-                let cut = c.len() - f.len();
-                // Only when it starts on a word boundary.
-                if c[..cut].ends_with(' ') {
-                    c = c[..cut].trim_end_matches([',', ' ']).to_string();
-                }
+        let mut changed = false;
+        for f in TRAILING_FILLER.iter().copied().chain(names.iter().map(String::as_str)) {
+            if let Some(rest) = strip_trailing_word(&c, f) {
+                c = rest.trim_end_matches([',', ' ']).to_string();
+                changed = true;
             }
         }
-        if c == before {
+        if !changed {
             break;
         }
     }
     c.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// `text` without a leading `word` that really is a word there ("hey nova",
+/// but not "heyday").
+fn strip_leading_word<'a>(text: &'a str, word: &str) -> Option<&'a str> {
+    if word.is_empty() || text.len() <= word.len() {
+        return None;
+    }
+    let (head, rest) = text.split_at(word.len());
+    (rest.starts_with(' ') && head.eq_ignore_ascii_case(word)).then(|| rest[1..].trim_start())
+}
+
+/// `text` without a trailing `word` on a word boundary.
+fn strip_trailing_word<'a>(text: &'a str, word: &str) -> Option<&'a str> {
+    if word.is_empty() || text.len() <= word.len() {
+        return None;
+    }
+    let cut = text.len() - word.len();
+    let (head, tail) = text.split_at(cut);
+    (head.ends_with(' ') && tail.eq_ignore_ascii_case(word)).then(|| head.trim_end())
 }
 
 /// Words that carry no content in a question about the clock or the date.
@@ -803,7 +833,7 @@ mod tests {
 
     fn index() -> AppIndex {
         let e = |n: &str| AppEntry { name: n.into(), app_id: Some(n.into()), path: None, exe: None };
-        AppIndex { apps: vec![e("Google Chrome"), e("Spotify"), e("Discord"), e("Visual Studio Code"), e("Steam")] }
+        AppIndex::from_names([e("Google Chrome"), e("Spotify"), e("Discord"), e("Visual Studio Code"), e("Steam")])
     }
 
     #[test]

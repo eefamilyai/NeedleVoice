@@ -48,6 +48,38 @@ pub fn list_voices() -> Vec<String> {
     tokens().into_iter().map(|(n, _)| n).collect()
 }
 
+/// The token for one named voice, if it is installed. Only that one token is
+/// added, where walking the full list would hold a reference to every voice on
+/// the machine for the sake of one of them.
+fn find_token(voice_name: &str) -> Option<ISpObjectToken> {
+    unsafe {
+        for cat_id in CATEGORIES {
+            let Ok(cat) = CoCreateInstance::<_, ISpObjectTokenCategory>(&SpObjectTokenCategory, None, CLSCTX_ALL)
+            else {
+                continue;
+            };
+            if cat.SetId(&HSTRING::from(cat_id), false).is_err() {
+                continue;
+            }
+            let Ok(list): Result<IEnumSpObjectTokens, _> = cat.EnumTokens(PCWSTR::null(), PCWSTR::null()) else {
+                continue;
+            };
+            let mut n = 0u32;
+            let _ = list.GetCount(&mut n);
+            for i in 0..n {
+                let Ok(tok) = list.Item(i) else { continue };
+                let Ok(p) = tok.GetStringValue(PCWSTR::null()) else { continue };
+                let name = p.to_string().unwrap_or_default();
+                CoTaskMemFree(Some(p.0 as *const _));
+                if name == voice_name {
+                    return Some(tok);
+                }
+            }
+        }
+        None
+    }
+}
+
 pub struct Speaker {
     voice: ISpVoice,
 }
@@ -58,7 +90,8 @@ impl Speaker {
         unsafe {
             let voice: ISpVoice = CoCreateInstance(&SpVoice, None, CLSCTX_ALL).map_err(|e| e.to_string())?;
             if !voice_name.is_empty() {
-                if let Some((_, tok)) = tokens().into_iter().find(|(n, _)| n == voice_name) {
+                // Only the chosen token is added, not every installed voice.
+                if let Some(tok) = find_token(voice_name) {
                     let _ = voice.SetVoice(&tok);
                 }
             }
