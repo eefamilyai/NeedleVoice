@@ -42,13 +42,18 @@ Get-ChildItem (Join-Path $release "*.dll") -ErrorAction SilentlyContinue | ForEa
     Copy-Item $_.FullName (Join-Path $InstallDir $_.Name) -Force
 }
 
-# Models the installed copy does not ship (Moonshine is a download in Settings,
-# so install it here when it is already on hand).
+# Recogniser models the installed copy does not ship. Every engine is copied, not
+# just the default one: selecting an engine whose files are missing leaves the
+# assistant unable to hear anything, and it retried the failed load on every
+# caption pass, which is exactly the "I changed the model and now it disengages".
 $devModels = Join-Path $root "models"
 $instModels = Join-Path $InstallDir "models"
-if (Test-Path (Join-Path $devModels "moonshine")) {
-    Copy-Item (Join-Path $devModels "moonshine") (Join-Path $instModels "moonshine") -Recurse -Force
-    Write-Host "installed the Moonshine models"
+foreach ($pack in @("moonshine", "sensevoice", "dolphin", "streaming")) {
+    $from = Join-Path $devModels $pack
+    if (Test-Path $from) {
+        Copy-Item $from (Join-Path $instModels $pack) -Recurse -Force
+        Write-Host "installed the $pack models"
+    }
 }
 # Any Whisper model the config asks for that the install does not have.
 $cfgFile = Join-Path $env:APPDATA "NeedleVoice\config.toml"

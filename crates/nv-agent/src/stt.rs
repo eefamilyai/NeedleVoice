@@ -88,6 +88,9 @@ pub struct Stt {
     sherpa: Option<OfflineRecognizer>,
     /// Save each clip for later inspection.
     save_clips: bool,
+    /// Set when the model would not load, so it is not retried for every caption
+    /// pass (which is how one failure became seven error lines a second).
+    failed: bool,
     last_used: Instant,
 }
 
@@ -113,11 +116,25 @@ impl Stt {
             SttEngine::Whisper => Backend::Whisper,
             SttEngine::SenseVoice => Backend::SenseVoice,
         };
-        // A chosen model that was never downloaded shouldn't leave the assistant
-        // unable to hear anything.
-        if backend == Backend::Whisper && !whisper_path.exists() && nv_core::moonshine_installed() {
-            log::warn!("Whisper model {} is missing — using Moonshine", whisper_path.display());
-            backend = Backend::Moonshine;
+        // A chosen engine whose files were never downloaded must not leave the
+        // assistant unable to hear anything — which is what "I changed the model
+        // and now it just disengages" was: SenseVoice was selected, its model was
+        // not installed, and every command came back empty.
+        if !Stt::installed(backend) {
+            let fallback = [Backend::Moonshine2, Backend::Moonshine, Backend::Whisper]
+                .into_iter()
+                .find(|b| Stt::installed(*b));
+            match fallback {
+                Some(b) => {
+                    log::warn!(
+                        "the {} model is not installed — using {} until it is",
+                        backend.name(),
+                        b.name()
+                    );
+                    backend = b;
+                }
+                None => log::error!("no speech model is installed: download one in Settings > Listening"),
+            }
         }
         Stt {
             backend,
@@ -127,6 +144,7 @@ impl Stt {
             whisper: None,
             sherpa: None,
             save_clips: cfg.save_clips,
+            failed: false,
             last_used: Instant::now(),
         }
     }
@@ -141,6 +159,7 @@ impl Stt {
             whisper: None,
             sherpa: None,
             save_clips: false,
+            failed: false,
             last_used: Instant::now(),
         }
     }
@@ -151,6 +170,21 @@ impl Stt {
         let mut stt = Stt::with(Backend::Whisper, threads, agent_name, "");
         stt.whisper_path = path;
         stt
+    }
+
+    /// Are this engine's model files on disk?
+    pub fn installed(backend: Backend) -> bool {
+        let models = nv_core::paths::models_dir();
+        match backend {
+            Backend::Whisper => nv_core::whisper_model_path("").exists() || models.join("ggml-tiny.en-q5_1.bin").exists(),
+            Backend::Moonshine => nv_core::moonshine_pack_dir(nv_core::MOONSHINE_PACKS[0]).exists(),
+            Backend::Moonshine2 => nv_core::moonshine_v2_installed(),
+            Backend::SenseVoice => models.join("sensevoice").join(nv_core::SENSEVOICE_PACK).join("model.int8.onnx").exists(),
+            Backend::SenseVoiceNano => {
+                models.join("sensevoice").join(nv_core::SENSEVOICE_NANO_PACK).join("model.int8.onnx").exists()
+            }
+            Backend::Dolphin => models.join("dolphin").join(nv_core::DOLPHIN_PACK).join("model.int8.onnx").exists(),
+        }
     }
 
     pub fn backend(&self) -> Backend {
@@ -200,10 +234,18 @@ impl Stt {
             return Ok(());
         }
         if self.sherpa.is_none() {
+            if self.failed {
+                return Err(format!("the {} model would not load", self.backend.name()));
+            }
             let t = Instant::now();
             let config = self.sherpa_config()?;
-            let recognizer = OfflineRecognizer::create(&config)
-                .ok_or_else(|| format!("could not load the {} model", self.backend.name()))?;
+            let recognizer = match OfflineRecognizer::create(&config) {
+                Some(r) => r,
+                None => {
+                    self.failed = true;
+                    return Err(format!("could not load the {} model", self.backend.name()));
+                }
+            };
             log::info!("{} loaded in {:?}", self.backend.name(), t.elapsed());
             self.sherpa = Some(recognizer);
         }
@@ -284,6 +326,9 @@ impl Stt {
     /// Transcribe 16 kHz mono audio.
     pub fn transcribe(&mut self, audio: &[f32]) -> Result<String, String> {
         self.last_used = Instant::now();
+        if self.failed {
+            return Err("no model loaded".into());
+        }
         // Loading is worth calling out separately: it is the difference between
         // "instant" and "why is this slow", and it is invisible from the outside.
         let load_started = Instant::now();

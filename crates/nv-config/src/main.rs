@@ -764,12 +764,39 @@ impl App {
         let mut download: Option<(&'static str, u32)> = None;
         let mut get_moonshine = false;
         ui::card_rows(ui, "Speech recognition", "Turns what you said into text", |ui| {
-            ui::row(ui, "Engine", "Moonshine is built for short commands and is ~30× faster here", |ui| {
+            ui::row(ui, "Engine", "", |ui| {
                 let mut engine = self.cfg.stt_engine;
                 if ui::segmented(ui, &mut engine, &SttEngine::ALL.map(|e| (e, e.label()))) {
                     self.cfg.stt_engine = engine;
                 }
             });
+            // What each engine is, and whether its model is here. Choosing one
+            // with no model used to leave the assistant unable to hear anything.
+            for (engine, blurb) in [
+                (SttEngine::Moonshine, "Moonshine - for short commands, English, about a quarter of a second."),
+                (SttEngine::SenseVoice, "SenseVoice - one model, reads Chinese too. Same speed; slightly behind Moonshine on clear speech."),
+                (SttEngine::Whisper, "Whisper - slower, most accurate with a big model. Choose its model below."),
+            ] {
+                let present = match engine {
+                    SttEngine::Whisper => nv_core::whisper_model_path(&self.cfg.whisper_model).exists(),
+                    SttEngine::Moonshine => nv_core::moonshine_installed(),
+                    SttEngine::SenseVoice => nv_core::paths::models_dir()
+                        .join("sensevoice")
+                        .join(nv_core::SENSEVOICE_PACK)
+                        .join("model.int8.onnx")
+                        .exists(),
+                };
+                ui.horizontal(|ui| {
+                    ui.add_space(14.0);
+                    let selected = self.cfg.stt_engine == engine;
+                    let colour = if selected { ui::theme(ui).text } else { ui::theme(ui).faint };
+                    ui.label(RichText::new(blurb).size(11.5).color(colour));
+                    if !present {
+                        ui::pill(ui, "not installed", ui::theme(ui).warn);
+                    }
+                });
+            }
+            ui.add_space(6.0);
             ui::row(
                 ui,
                 "Save what it hears",
