@@ -183,6 +183,8 @@ pub struct Config {
     /// Save every clip the recogniser is given, for working out why a word came
     /// through wrong. They land in `clips/` next to the settings file.
     pub save_clips: bool,
+    /// Show what is being heard, above the bubble, while it is being said.
+    pub live_transcript: bool,
     /// Whisper model file in the models folder.
     pub whisper_model: String,
     /// CPU threads used for speech recognition and Needle.
@@ -276,6 +278,7 @@ impl Default for Config {
             stt_engine: SttEngine::Moonshine,
             avoid_bluetooth_mic: false,
             save_clips: false,
+            live_transcript: true,
             whisper_model: crate::DEFAULT_WHISPER_MODEL.into(),
             threads: recommended_threads(),
             needle_depth: 20,

@@ -158,6 +158,15 @@ pub fn run(cfg: Config, shared: Arc<Shared>, apps: Arc<RwLock<AppIndex>>, tts: A
     // Streaming wake-word spotter: it hears the name the moment it is spoken,
     // instead of waiting for Whisper to transcribe a finished sentence. If the
     // model isn't installed we fall back to the old Whisper-based detection.
+    // Live captions. A small streaming model was tried first and its partial
+    // text was not worth putting on screen ("OR" for "reminder to call my mum"),
+    // so the caption is built from the accurate engine instead: the audio so far
+    // is re-transcribed a few times a second while you speak. It costs a fifth of
+    // a second per pass and shows the same words the final transcript will have.
+    let captions = cfg.live_transcript;
+    let mut caption_buf: Vec<f32> = Vec::new();
+    let mut caption_at = Instant::now();
+
     let mut kws = match crate::kws::Kws::new(&cfg) {
         Ok(k) => Some(k),
         Err(e) => {
@@ -359,6 +368,11 @@ pub fn run(cfg: Config, shared: Arc<Shared>, apps: Arc<RwLock<AppIndex>>, tts: A
                 if let Some(word) = k.feed(&frame) {
                     let t = Instant::now();
                     log::info!("wake word: \"{word}\" — listening now");
+                    if captions {
+                        caption_buf.clear();
+                        caption_at = Instant::now();
+                        crate::caption::clear();
+                    }
                     if loading.is_none() {
                         if let Some(mut s) = stt.take() {
                             if s.loaded() {
@@ -413,6 +427,18 @@ pub fn run(cfg: Config, shared: Arc<Shared>, apps: Arc<RwLock<AppIndex>>, tts: A
                 speech
             };
 
+            // While a command is being spoken, keep the caption up to date.
+            if captions && matches!(phase, Phase::Await { .. } | Phase::Command { .. }) {
+                caption_buf.extend_from_slice(&frame);
+                if caption_at.elapsed() > Duration::from_millis(650) && caption_buf.len() > RATE as usize / 3 {
+                    caption_at = Instant::now();
+                    let heard = transcribe(&mut stt, &mut loading, &caption_buf);
+                    if !heard.is_empty() {
+                        log::info!("caption: {heard:?}");
+                        crate::caption::set(&heard);
+                    }
+                }
+            }
             let outcome = step(&mut seg, &mut preroll, &frame, speech, &phase, &cfg, after_reply);
             match outcome {
                 Step::Nothing => {}
@@ -442,6 +468,7 @@ pub fn run(cfg: Config, shared: Arc<Shared>, apps: Arc<RwLock<AppIndex>>, tts: A
                                 if has_words(&hit.command) {
                                     shared.set_mode(Mode::Listening);
                                     tts.prepare();
+                                    crate::caption::clear();
                                     let _ = cmd_tx.send((hit.command.clone(), s.audio.clone()));
                                     phase = Phase::Idle;
                                     drain(mic.as_ref());
@@ -476,6 +503,7 @@ pub fn run(cfg: Config, shared: Arc<Shared>, apps: Arc<RwLock<AppIndex>>, tts: A
                             };
                             log::info!("heard: {text:?} -> command {command:?}");
                             if has_words(&command) {
+                                crate::caption::clear();
                                 let _ = cmd_tx.send((command.clone(), s.audio.clone()));
                                 phase = Phase::Idle;
                                 drain(mic.as_ref());

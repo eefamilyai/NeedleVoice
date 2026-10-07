@@ -435,8 +435,30 @@ fn clean(s: &str) -> String {
             _ => {}
         }
     }
-    let out = out.split_whitespace().collect::<Vec<_>>().join(" ");
-    dedupe_sentences(&out)
+    // SenseVoice returns capitals and, now and then, a character from another
+    // script in the middle of a word; a command is English words either way.
+    let ascii: String = out
+        .chars()
+        .map(|c| if c.is_ascii() || c.is_whitespace() { c } else { ' ' })
+        .collect();
+    let sentence = ascii.split_whitespace().collect::<Vec<_>>().join(" ");
+    dedupe_words(&dedupe_sentences(&sentence)).to_lowercase()
+}
+
+/// Collapse words repeated back to back. Whisper does this on a partial clip —
+/// the live caption showed "Reminder reminder reminder reminder rem" before the
+/// sentence had been said — and the same guard is harmless on a finished one.
+fn dedupe_words(s: &str) -> String {
+    let mut out: Vec<&str> = Vec::new();
+    for word in s.split_whitespace() {
+        let repeat = out.last().is_some_and(|last| {
+            last.eq_ignore_ascii_case(word.trim_matches(|c: char| !c.is_alphanumeric()))
+        });
+        if !repeat {
+            out.push(word);
+        }
+    }
+    out.join(" ")
 }
 
 /// With a shortened audio context Whisper sometimes loops ("Open Chrome.
@@ -481,9 +503,9 @@ fn dedupe_sentences(s: &str) -> String {
 mod tests {
     #[test]
     fn dedupes_loops() {
-        assert_eq!(super::clean("Hey Nova, open Chrome. Hey Nova, open Chrome. Hey"), "Hey Nova, open Chrome.");
+        assert_eq!(super::clean("Hey Nova, open Chrome. Hey Nova, open Chrome. Hey"), "hey nova, open chrome.");
         assert_eq!(super::clean("[BLANK_AUDIO]"), "");
-        assert_eq!(super::clean("What is it? Tell me."), "What is it? Tell me.");
+        assert_eq!(super::clean("What is it? Tell me."), "what is it? tell me.");
         assert_eq!(super::clean("(music) open chrome"), "open chrome");
     }
 
@@ -492,15 +514,15 @@ mod tests {
     fn a_looping_transcript_keeps_what_follows() {
         assert_eq!(
             super::clean("Open Chrome. Open Chrome. And search for trains."),
-            "Open Chrome. And search for trains."
+            "open chrome. and search for trains."
         );
         // A genuine second sentence with the same opening is not a stutter.
         assert_eq!(
             super::clean("Open Chrome. Open Spotify."),
-            "Open Chrome. Open Spotify."
+            "open chrome. open spotify."
         );
         // Repeating something from earlier is a repeat, not a loop to be cut.
-        assert_eq!(super::clean("Set a timer. Get coffee. Set a timer."), "Set a timer. Get coffee. Set a timer.");
+        assert_eq!(super::clean("Set a timer. Get coffee. Set a timer."), "set a timer. get coffee. set a timer.");
     }
 
     #[test]
@@ -531,4 +553,28 @@ pub fn normalize_padded(audio: &[f32], lead: usize, least: usize) -> Vec<f32> {
     out.extend(audio.iter().map(|s| (s * gain).clamp(-1.0, 1.0)));
     out.resize(out.len().max(least), 0.0);
     out
+}
+
+#[cfg(test)]
+mod caption_tests {
+    use super::*;
+
+    #[test]
+    fn a_repeated_word_is_said_once() {
+        // Whisper's partial-clip loop, seen in the live caption.
+        assert_eq!(clean("Reminder reminder reminder reminder rem"), "reminder rem");
+        assert_eq!(clean("reminder reminder"), "reminder");
+        // Real repetition is not a loop and is left alone once.
+        assert_eq!(clean("very very good"), "very good");
+        assert_eq!(clean("no no no"), "no");
+    }
+
+    #[test]
+    fn sense_voice_shouting_and_stray_scripts_are_tidied() {
+        // SenseVoice returns capitals, and occasionally a character from another
+        // script in the middle of a word.
+        assert_eq!(clean("HEY REGGIE OPEN CHROME"), "hey reggie open chrome");
+        let mangled = format!("SEVENHRT{}Y IN THE MORNING", char::from_u32(0x5341).unwrap());
+        assert!(clean(&mangled).chars().all(|c| c.is_ascii()), "{:?}", clean(&mangled));
+    }
 }

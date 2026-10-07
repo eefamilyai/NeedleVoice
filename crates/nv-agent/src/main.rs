@@ -4,9 +4,11 @@
 
 mod audio;
 mod bubble;
+mod caption;
 mod chime;
 mod kws;
 mod listener;
+mod live;
 mod logger;
 mod overlay;
 mod scheduler;
@@ -206,6 +208,11 @@ fn main() {
     }
 
     let shared = overlay::Shared::new();
+    if cfg.live_transcript && nv_core::streaming_installed() {
+        if let Err(e) = caption::create(cfg.overlay_margin + cfg.overlay_size + 16) {
+            log::warn!("caption window: {e}");
+        }
+    }
     if let Err(e) = overlay::create(shared.clone(), cfg.show_overlay, cfg.overlay_size, cfg.overlay_margin, cfg.accent_rgb()) {
         log::error!("overlay: {e}");
     }

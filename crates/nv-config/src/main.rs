@@ -450,6 +450,23 @@ impl App {
         ui::card(ui, "Bubble", "The floating circle at the bottom of the screen", |ui| {
             ui::switch(ui, &mut self.cfg.show_overlay, "Show the bubble while listening");
             ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                ui::switch(ui, &mut self.cfg.live_transcript, "Show what you are saying, above the bubble");
+            });
+            if self.cfg.live_transcript && !nv_core::streaming_installed() {
+                ui.horizontal(|ui| {
+                    ui.add_space(26.0);
+                    ui::pill(ui, "streaming model not installed", ui::theme(ui).warn);
+                    ui::hint(ui, "until it is, there is nothing to show while you speak");
+                });
+            }
+            if self.cfg.live_transcript {
+                ui.horizontal(|ui| {
+                    ui.add_space(26.0);
+                    ui::hint(ui, "it needs the 43 MB streaming model; commands still use the main engine");
+                });
+            }
+            ui.add_space(10.0);
             ui::field(ui, "Accent colour", "Used across the bubble, this window and the tray icon", |ui| {
                 ui.horizontal_wrapped(|ui| {
                     for (name, hex) in ACCENT_PRESETS {
