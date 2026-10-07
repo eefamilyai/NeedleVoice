@@ -131,6 +131,15 @@ pub fn find_name(words: &[String], name: &str, search_window: usize) -> Option<(
         // Whisper sometimes splits a name ("no va").
         for len in 1..=(name_words + 1).min(words.len() - start) {
             let joined: String = words[start..start + len].concat();
+            // A candidate much longer than the name is not the name. Jaro-Winkler
+            // rewards a shared prefix, so "reggy reminder" scored 0.9 against
+            // "reggie" and the window swallowed the word after the name — which is
+            // how "reminder to call my mum" lost its first word. Five characters
+            // of slack leaves room for a prefix glued on ("heynova", "okaynova")
+            // and not for a whole extra word.
+            if joined.chars().count() > target.chars().count() + 5 {
+                continue;
+            }
             let sim = strsim::jaro_winkler(&joined, &target);
             if best.map_or(true, |(b, _, _)| sim > b + 1e-9) {
                 best = Some((sim, start, start + len));

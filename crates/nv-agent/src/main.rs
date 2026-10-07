@@ -143,6 +143,57 @@ fn main() {
         return;
     }
 
+    // `--bench-live <model> <clip.wav>…`: what a caption would show, and when.
+    // Prints the partial text every half second while feeding the clip in real
+    // time, which is the only way to judge a streaming model for a caption.
+    if args.iter().any(|a| a == "--bench-live") {
+        let rest: Vec<&String> = args.iter().skip_while(|a| *a != "--bench-live").skip(1).collect();
+        let Some((model, clips)) = rest.split_first() else {
+            eprintln!("usage: --bench-live <nemo|zipformer|kroko|20m> <clip.wav>…");
+            return;
+        };
+        let Some(kind) = live::LiveModel::parse(model) else {
+            eprintln!("unknown streaming model {model}");
+            return;
+        };
+        let cfg = nv_core::config::Config::load();
+        let mut live = match live::Live::with(kind, cfg.threads) {
+            Ok(l) => l,
+            Err(e) => {
+                eprintln!("{e}");
+                return;
+            }
+        };
+        for clip in clips {
+            let Ok(bytes) = std::fs::read(clip) else { continue };
+            let audio: Vec<f32> = bytes[44..]
+                .chunks_exact(2)
+                .map(|b| i16::from_le_bytes([b[0], b[1]]) as f32 / 32768.0)
+                .collect();
+            println!("--- {} ({}), {:.1}s", kind.name(), std::path::Path::new(clip).file_name().unwrap_or_default().to_string_lossy(), audio.len() as f32 / 16000.0);
+            live.reset();
+            let mut fed = 0usize;
+            let mut next_report = 0usize;
+            let mut latest = String::new();
+            while fed < audio.len() {
+                let end = (fed + 320).min(audio.len());
+                if let Some(text) = live.feed(&audio[fed..end]) {
+                    // What the caption would show: lowercased, without the name.
+                    latest = text.to_lowercase();
+                }
+                fed = end;
+                if fed >= next_report {
+                    next_report = fed + 8000; // every half second, in real time
+                    if !latest.is_empty() {
+                        println!("  {:4.1}s  {latest}", fed as f32 / 16000.0);
+                    }
+                }
+            }
+            println!("  final  {latest}");
+        }
+        return;
+    }
+
     // `--chime`: play the wake-up chime once and exit. The settings app uses
     // this so you can hear exactly what waking sounds like.
     if args.iter().any(|a| a == "--chime") {

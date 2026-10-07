@@ -158,14 +158,25 @@ pub fn run(cfg: Config, shared: Arc<Shared>, apps: Arc<RwLock<AppIndex>>, tts: A
     // Streaming wake-word spotter: it hears the name the moment it is spoken,
     // instead of waiting for Whisper to transcribe a finished sentence. If the
     // model isn't installed we fall back to the old Whisper-based detection.
-    // Live captions. A small streaming model was tried first and its partial
-    // text was not worth putting on screen ("OR" for "reminder to call my mum"),
-    // so the caption is built from the accurate engine instead: the audio so far
-    // is re-transcribed a few times a second while you speak. It costs a fifth of
-    // a second per pass and shows the same words the final transcript will have.
-    let captions = cfg.live_transcript;
-    let mut caption_buf: Vec<f32> = Vec::new();
-    let mut caption_at = Instant::now();
+    // Live captions, from a streaming model — one built to emit words as they are
+    // spoken rather than after the sentence. The first one tried (a 20 M
+    // zipformer) was too crude to show; the NeMo FastConformer CTC measured
+    // properly: words appear about 150 ms after they are said, and the text is
+    // right. See `--bench-live`.
+    let mut live = if cfg.live_transcript {
+        match crate::live::Live::new(&cfg) {
+            Ok(l) => {
+                log::info!("live transcript ready ({})", l.model().name());
+                Some(l)
+            }
+            Err(e) => {
+                log::warn!("live transcript unavailable ({e})");
+                None
+            }
+        }
+    } else {
+        None
+    };
 
     let mut kws = match crate::kws::Kws::new(&cfg) {
         Ok(k) => Some(k),
@@ -186,6 +197,8 @@ pub fn run(cfg: Config, shared: Arc<Shared>, apps: Arc<RwLock<AppIndex>>, tts: A
     let mut spotter_quiet_ms = 0u32;
     // Ignore the mic briefly after waking so the chime isn't taken as speech.
     let mut deaf_frames: u32 = 0;
+    // Last line shown in the caption, so only changes are redrawn.
+    let mut last_caption = String::new();
     // (peak seen, when it was last heard) — for the silence warning below.
     let mut silence_watch: Option<(f32, Instant)> = Some((0.0, Instant::now()));
     let mut silence_reported = false;
@@ -368,9 +381,9 @@ pub fn run(cfg: Config, shared: Arc<Shared>, apps: Arc<RwLock<AppIndex>>, tts: A
                 if let Some(word) = k.feed(&frame) {
                     let t = Instant::now();
                     log::info!("wake word: \"{word}\" — listening now");
-                    if captions {
-                        caption_buf.clear();
-                        caption_at = Instant::now();
+                    if let Some(l) = live.as_mut() {
+                        l.reset();
+                        last_caption.clear();
                         crate::caption::clear();
                     }
                     if loading.is_none() {
@@ -427,15 +440,22 @@ pub fn run(cfg: Config, shared: Arc<Shared>, apps: Arc<RwLock<AppIndex>>, tts: A
                 speech
             };
 
-            // While a command is being spoken, keep the caption up to date.
-            if captions && matches!(phase, Phase::Await { .. } | Phase::Command { .. }) {
-                caption_buf.extend_from_slice(&frame);
-                if caption_at.elapsed() > Duration::from_millis(650) && caption_buf.len() > RATE as usize / 3 {
-                    caption_at = Instant::now();
-                    let heard = transcribe(&mut stt, &mut loading, &caption_buf);
-                    if !heard.is_empty() {
-                        log::info!("caption: {heard:?}");
-                        crate::caption::set(&heard);
+            // While a command is being spoken, feed the streaming model and show
+            // what it has so far.
+            if let Some(l) = live.as_mut() {
+                // Feed from the moment the name is heard, so the first word of the
+                // command is never missed (gating this on the settle window lost
+                // "reminder" and the caption began at "to"). The fragment of the
+                // name that the model invents a word for — it read "a reggy" — is
+                // stripped from the text below instead.
+                if matches!(phase, Phase::Await { .. } | Phase::Command { .. }) {
+                    if let Some(text) = l.feed(&frame) {
+                        let line = strip_leading_name(&text.to_lowercase(), &cfg);
+                        if !line.trim().is_empty() && line != last_caption {
+                            last_caption = line.clone();
+                            log::info!("caption: {line:?}");
+                            crate::caption::set(&line);
+                        }
                     }
                 }
             }
@@ -748,9 +768,13 @@ fn has_words(s: &str) -> bool {
 fn strip_leading_name(text: &str, cfg: &Config) -> String {
     let tokens: Vec<&str> = text.split_whitespace().collect();
     let words: Vec<String> = tokens.iter().map(|t| nv_core::fuzzy::squash(t)).collect();
+    // Only strip a match that is really the name. This used to strip whatever
+    // scored best, and "remind" scores 0.82 against "reggie" — enough to be the
+    // best match, not close enough to be the name — so the word after the wake
+    // phrase was thrown away with it.
     match nv_core::fuzzy::find_name(&words, &cfg.agent_name, 3) {
-        Some((_, _, end)) => tokens.get(end..).unwrap_or_default().join(" "),
-        None => text.to_string(),
+        Some((score, _, end)) if score >= 0.85 => tokens.get(end..).unwrap_or_default().join(" "),
+        _ => text.to_string(),
     }
 }
 

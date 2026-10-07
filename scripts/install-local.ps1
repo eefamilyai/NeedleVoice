@@ -48,13 +48,24 @@ Get-ChildItem (Join-Path $release "*.dll") -ErrorAction SilentlyContinue | ForEa
 # caption pass, which is exactly the "I changed the model and now it disengages".
 $devModels = Join-Path $root "models"
 $instModels = Join-Path $InstallDir "models"
-foreach ($pack in @("moonshine", "sensevoice", "dolphin", "streaming")) {
+# `streaming` holds several packs for measurement; only the caption's own
+# model is installed.
+foreach ($pack in @("moonshine", "sensevoice", "dolphin")) {
     $from = Join-Path $devModels $pack
     if (Test-Path $from) {
         Copy-Item $from (Join-Path $instModels $pack) -Recurse -Force
         Write-Host "installed the $pack models"
     }
 }
+# The streaming model the live transcript uses.
+$streamSrc = Join-Path $devModels "streaming\sherpa-onnx-nemo-streaming-fast-conformer-ctc-en-80ms-int8"
+if (Test-Path $streamSrc) {
+    $streamDst = Join-Path $instModels "streaming\sherpa-onnx-nemo-streaming-fast-conformer-ctc-en-80ms-int8"
+    New-Item -ItemType Directory -Force -Path $streamDst | Out-Null
+    Copy-Item "$streamSrc\*" $streamDst -Force
+    Write-Host "installed the streaming model (live transcript)"
+}
+
 # Any Whisper model the config asks for that the install does not have.
 $cfgFile = Join-Path $env:APPDATA "NeedleVoice\config.toml"
 if (Test-Path $cfgFile) {

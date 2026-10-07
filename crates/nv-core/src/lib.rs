@@ -37,7 +37,7 @@ pub const SENSEVOICE_NANO_PACK: &str = "sherpa-onnx-sense-voice-funasr-nano-int8
 /// Dolphin: a small multilingual CTC model.
 pub const DOLPHIN_PACK: &str = "sherpa-onnx-dolphin-base-ctc-multi-lang-int8-2025-04-02";
 /// The streaming model behind the live transcript: 20 M parameters, English.
-pub const STREAMING_PACK: &str = "sherpa-onnx-streaming-zipformer-en-20M-2023-02-17";
+pub const STREAMING_PACK: &str = "sherpa-onnx-nemo-streaming-fast-conformer-ctc-en-80ms-int8";
 /// Moonshine v2, which supersedes v1 when it is present.
 pub const MOONSHINE_V2_PACK: &str = "sherpa-onnx-moonshine-base-en-quantized-2026-02-27";
 /// The pack the settings app downloads when none is installed.
@@ -83,13 +83,12 @@ pub fn streaming_dir() -> std::path::PathBuf {
     paths::models_dir().join("streaming").join(STREAMING_PACK)
 }
 
-/// Is the streaming model on disk?
+/// Is the streaming model on disk? The one that is installed is a NeMo
+/// FastConformer, so it is a single model file — this used to look for the
+/// zipformer's three, which meant the caption window was never created.
 pub fn streaming_installed() -> bool {
     let d = streaming_dir();
-    d.join("encoder-epoch-99-avg-1.int8.onnx").exists()
-        && d.join("decoder-epoch-99-avg-1.int8.onnx").exists()
-        && d.join("joiner-epoch-99-avg-1.int8.onnx").exists()
-        && d.join("tokens.txt").exists()
+    d.join("model.int8.onnx").exists() && d.join("tokens.txt").exists()
 }
 
 /// Is any Moonshine pack usable?

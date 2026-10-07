@@ -463,7 +463,12 @@ impl App {
             if self.cfg.live_transcript {
                 ui.horizontal(|ui| {
                     ui.add_space(26.0);
-                    ui::hint(ui, "it needs the 43 MB streaming model; commands still use the main engine");
+                    ui::hint(
+                        ui,
+                        "Shown by a streaming model - one that writes words as they are spoken, without waiting \
+                         for the sentence to end (NeMo FastConformer, 126 MB; words appear about 150 ms after they \
+                         are said). The engines above cannot do this: they only see a finished sentence.",
+                    );
                 });
             }
             ui.add_space(10.0);
