@@ -92,8 +92,13 @@ pub fn streaming_installed() -> bool {
 }
 
 /// Is any Moonshine pack usable?
+///
+/// v2 counts. It is the preferred pack and the one the installer ships, so
+/// leaving it out of this test meant a fresh install reported Moonshine as
+/// missing, fell back to Whisper, and never used the model it had just
+/// downloaded 135 MB of.
 pub fn moonshine_installed() -> bool {
-    MOONSHINE_PACKS.iter().any(|p| pack_complete(&moonshine_pack_dir(p)))
+    moonshine_v2_installed() || MOONSHINE_PACKS.iter().any(|p| pack_complete(&moonshine_pack_dir(p)))
 }
 
 /// The Whisper model to load. If the configured file is not there — a fresh

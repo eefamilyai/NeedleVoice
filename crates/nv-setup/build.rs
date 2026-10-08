@@ -45,36 +45,49 @@ fn main() {
         std::fs::write(&out, []).unwrap();
         return;
     }
-    for (src, _) in &files {
-        println!("cargo:rerun-if-changed={}", src.display());
-        assert!(src.exists(), "missing {} — build nv-agent and nv-config in release first", src.display());
-    }
     let voice = "vits-piper-en_US-lessac-medium";
     let voice_dir = models.join("voices").join(voice);
     assert!(voice_dir.exists(), "missing default voice {}", voice_dir.display());
     println!("cargo:rerun-if-changed={}", voice_dir.display());
 
-    // Moonshine is the default recogniser now, so the tiny pack rides along:
-    // same speed as base, 118 MB instead of 273, and the settings app can
-    // upgrade to base in one click. Without it a fresh install would need a
-    // download before it could hear anything.
-    let moonshine_pack = "sherpa-onnx-moonshine-tiny-en-int8";
+    // Moonshine is the default recogniser, and v2 is the better of the two packs:
+    // the same speed as v1, smaller, and it reads "chrome" correctly where v1 read
+    // "loafy". Shipping the weaker tiny pack would make the default engine the
+    // worst one available out of the box.
+    let moonshine_pack = "sherpa-onnx-moonshine-base-en-quantized-2026-02-27";
     let moonshine_dir = models.join("moonshine").join(moonshine_pack);
-    let moonshine_file = |f: &str| moonshine_dir.join(f).exists();
     assert!(
-        ["preprocess.onnx", "encode.int8.onnx", "uncached_decode.int8.onnx", "cached_decode.int8.onnx", "tokens.txt"]
+        ["encoder_model.ort", "decoder_model_merged.ort", "tokens.txt"]
             .iter()
-            .all(|f| moonshine_file(f)),
-        "missing the Moonshine model — run scripts/fetch-models.ps1 -WithMoonshine"
+            .all(|f| moonshine_dir.join(f).exists()),
+        "missing the Moonshine v2 model at {} — run scripts/fetch-models.ps1",
+        moonshine_dir.display()
     );
-    println!("cargo:rerun-if-changed={}", moonshine_dir.display());
 
-    // The wake-word keyword model (about 5 MB): without it the agent has to
-    // fall back to Whisper for wake detection.
+    // The wake-word keyword model (about 5 MB): without it the agent has to fall
+    // back to Whisper for wake detection.
     let kws = "sherpa-onnx-kws-zipformer-gigaspeech-3.3M-2024-01-01";
     let kws_dir = models.join("kws").join(kws);
     assert!(kws_dir.join("tokens.txt").exists(), "missing the wake-word model — run scripts\\fetch-models.ps1");
-    println!("cargo:rerun-if-changed={}", kws_dir.display());
+
+    // The streaming model behind the live transcript. Without it a fresh install
+    // has the caption switched on and nothing to show, which looks like a broken
+    // setting rather than a missing download.
+    let streaming_pack = "sherpa-onnx-nemo-streaming-fast-conformer-ctc-en-80ms-int8";
+    let streaming_dir = models.join("streaming").join(streaming_pack);
+    assert!(
+        ["model.int8.onnx", "tokens.txt"].iter().all(|f| streaming_dir.join(f).exists()),
+        "missing the streaming model at {} — needed for the live transcript",
+        streaming_dir.display()
+    );
+
+    for (src, _) in &files {
+        println!("cargo:rerun-if-changed={}", src.display());
+        assert!(src.exists(), "missing {} — build nv-agent and nv-config in release first", src.display());
+    }
+    for dir in [&voice_dir, &kws_dir, &moonshine_dir, &streaming_dir] {
+        println!("cargo:rerun-if-changed={}", dir.display());
+    }
 
     let file = std::fs::File::create(&out).unwrap();
     let mut enc = zstd::stream::Encoder::new(file, 12).unwrap();
@@ -87,6 +100,7 @@ fn main() {
         add_dir(&mut tar, &voice_dir, &format!("models/voices/{voice}"));
         add_dir(&mut tar, &kws_dir, &format!("models/kws/{kws}"));
         add_dir(&mut tar, &moonshine_dir, &format!("models/moonshine/{moonshine_pack}"));
+        add_dir(&mut tar, &streaming_dir, &format!("models/streaming/{streaming_pack}"));
         tar.finish().unwrap();
     }
     enc.finish().unwrap();

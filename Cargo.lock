@@ -1834,7 +1834,7 @@ dependencies = [
 
 [[package]]
 name = "nv-agent"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "cpal",
  "log",
@@ -1849,7 +1849,7 @@ dependencies = [
 
 [[package]]
 name = "nv-config"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "cpal",
  "eframe",
@@ -1861,7 +1861,7 @@ dependencies = [
 
 [[package]]
 name = "nv-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bzip2 0.6.1",
  "log",
@@ -1878,7 +1878,7 @@ dependencies = [
 
 [[package]]
 name = "nv-setup"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "eframe",
  "nv-core",
@@ -1890,7 +1890,7 @@ dependencies = [
 
 [[package]]
 name = "nv-uninstall"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "nv-core",
  "nv-version",
@@ -1898,7 +1898,7 @@ dependencies = [
 
 [[package]]
 name = "nv-version"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "winresource",
 ]
