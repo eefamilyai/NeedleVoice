@@ -293,7 +293,7 @@ impl Brain {
     }
 
     fn ask_needle(&mut self, command: &str, cfg: &Config) -> Result<(Vec<Action>, Option<String>), String> {
-        let tools_json = tools::tools_json(cfg);
+        let (tools_json, shortlisted) = tools::tools_json_for(cfg, command);
         let engine = self.ensure_loaded()?;
         let opts = V3Options {
             constrain: true,
@@ -301,14 +301,114 @@ impl Brain {
             max_new_tokens: 160,
             ..Default::default()
         };
+        let t = Instant::now();
         let result = engine.generate(command, &tools_json, &opts);
-        let reasoning = V3Engine::reasoning(&result.text).map(String::from);
+        let mut reasoning = V3Engine::reasoning(&result.text).map(String::from);
+        log::info!(
+            "needle: {} bytes of tools{}, {:?}{}",
+            tools_json.len(),
+            if shortlisted { " (shortlist)" } else { "" },
+            t.elapsed(),
+            if result.prompt_truncated { " [prompt truncated]" } else { "" }
+        );
         log::info!("needle: {:?}", result.text);
-        let Some(json) = extract_tool_call(&result.text) else {
-            return Ok((Vec::new(), reasoning));
-        };
-        Ok((parse_calls(&json, cfg), reasoning))
+        let extracted = extract_tool_call(&result.text);
+        // Did it try to answer at all? A reply that opened a tool call but was cut
+        // short is a different failure from one that never named a tool, and only
+        // the second is worth a second pass.
+        let attempted = extracted.is_some() || result.text.contains("<tool_call>");
+        let mut calls = extracted.map(|json| parse_calls(&json, cfg)).unwrap_or_default();
+        // A short list can be too short: the tool the command wanted may not have
+        // been on it. Re-ask with everything, which costs the old seconds and so
+        // only happens when the fast pass produced no answer at all.
+        if shortlisted && calls.is_empty() && !attempted {
+            log::info!("needle: nothing from the shortlist — asking again with every tool");
+            let full = tools::tools_json(cfg);
+            let t = Instant::now();
+            let retry = engine.generate(command, &full, &opts);
+            log::info!("needle: full list took {:?}", t.elapsed());
+            log::info!("needle: {:?}", retry.text);
+            if let Some(json) = extract_tool_call(&retry.text) {
+                calls = parse_calls(&json, cfg);
+            }
+            reasoning = reasoning.or_else(|| V3Engine::reasoning(&retry.text).map(String::from));
+        }
+        Ok((calls, reasoning))
     }
+}
+
+/// `--bench-needle`: run the real prompt through the real engine and report where
+/// the milliseconds go. One pass with a one-token budget measures the prompt on
+/// its own, so a second pass at the real budget separates prefill from decoding —
+/// which is the difference between "the prompt is too long" and "the model talks
+/// too much", and they need opposite fixes.
+pub fn bench_needle(command: &str, depth: usize, budget: usize) -> String {
+    let mut out = String::new();
+    let cfg = crate::Config::load();
+    let model = crate::paths::models_dir().join(crate::NEEDLE_MODEL);
+    let tools = tools::tools_json(&cfg);
+    let (short, did_short) = tools::tools_json_for(&cfg, command);
+    let mb = std::fs::metadata(&model).map(|m| m.len() as f64 / 1e6).unwrap_or(0.0);
+    out.push_str(&format!("model   {} ({mb:.1} MB)\n", model.display()));
+    out.push_str(&format!(
+        "tools   {} bytes full, {} bytes shortlisted ({did_short}) for {command:?}\n",
+        tools.len(),
+        short.len()
+    ));
+    let tools = short;
+    let t = Instant::now();
+    let engine = match V3Engine::load_with_depth(&model, depth) {
+        Ok(e) => e,
+        Err(e) => return format!("{out}load failed: {e:?}"),
+    };
+    out.push_str(&format!("load    {:?} at depth {depth}\n", t.elapsed()));
+    let mut first: Option<(usize, Duration, usize)> = None;
+    // A third pass with no tool definitions at all, to show how much of the time
+    // is the prompt rather than the model. The tools block is identical on every
+    // command, so this is the ceiling for any prompt-caching work.
+    let runs: Vec<(usize, String, String)> = vec![
+        (1, "full".into(), tools.clone()),
+        (budget, "full".into(), tools.clone()),
+        (1, "no tools".into(), "[]".into()),
+    ];
+    for (tokens, label, tools) in runs {
+        let tools = &tools;
+        let opts = V3Options {
+            constrain: true,
+            kv_precision: KvPrecision::Int8,
+            max_new_tokens: tokens,
+            ..Default::default()
+        };
+        let t = Instant::now();
+        let r = engine.generate(command, &tools, &opts);
+        let took = t.elapsed();
+        let generated = r.tokens.len();
+        out.push_str(&format!(
+            "{label:>8} budget {tokens:3}  {:>7.0?}  prompt {} positions, {} out, stop {:?}{}\n",
+            took,
+            r.positions,
+            generated,
+            r.stop,
+            if r.prompt_truncated { " TRUNCATED" } else { "" }
+        ));
+        if label == "full" && tokens == 1 {
+            first = Some((r.positions, took, generated));
+        } else if label == "full" {
+            if let Some((_, prefill, _)) = first {
+                let decode = took.saturating_sub(prefill);
+                out.push_str(&format!(
+                    "split   prefill {:?} of {:?}  -  decoding {:?} for {} tokens ({:.1} tok/s)\n",
+                    prefill,
+                    took,
+                    decode,
+                    generated,
+                    generated as f32 / decode.as_secs_f32().max(1e-6)
+                ));
+            }
+            out.push_str(&format!("said    {:?}\n", r.text.chars().take(300).collect::<String>()));
+        }
+    }
+    out
 }
 
 /// Turn one tool call into an action. Shared by Needle's JSON and the instant

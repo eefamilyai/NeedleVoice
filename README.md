@@ -65,9 +65,10 @@ smaller model.
 
 | Executable | What it does |
 |---|---|
-| `NeedleVoiceSetup.exe` | Installer (per-user, no admin). Also acts as `Uninstall.exe`. |
+| `NeedleVoiceSetup.exe` | Installer (per-user, no admin). Installing only — removing is the uninstaller's job. |
 | `NeedleVoice.exe` | Background agent: tray icon, wake word, bubble, voice. |
 | `NeedleVoiceConfig.exe` | Settings app. |
+| `NeedleVoiceUninstall.exe` | Uninstaller, written into the install folder as `Uninstall.exe`. Small, no payload. |
 
 ### Pipeline
 
@@ -158,6 +159,13 @@ powershell -ExecutionPolicy Bypass -File scripts\build-installer.ps1
 This downloads the bundled models into `models\`, builds everything and writes
 `dist\NeedleVoiceSetup.exe`.
 
+Add `-Sign` to Authenticode-sign the installer and every binary it ships, given a
+certificate in `$env:NV_SIGN_CERT` and its password in `$env:NV_SIGN_PASSWORD`.
+Signing is worth doing — Defender's machine-learning heuristic once quarantined
+this installer as `Trojan:Win32/Wacatac.B!ml`. That was a false positive caused
+by the build's shape, and `docs\installer.md` records what it was and the rules
+that keep it fixed.
+
 `.cargo\config.toml` matters: it forces `/O2` and AVX2 for whisper.cpp. Without
 it, MSVC builds whisper.cpp unoptimised and it runs about 30× slower.
 
@@ -172,7 +180,8 @@ it, MSVC builds whisper.cpp unoptimised and it runs about 30× slower.
 * `NV_FAKE_MIC=<16 kHz mono wav>` plays a file into the agent in real time,
   which is how the wake word is tested without a microphone.
 * `NeedleVoiceSetup.exe --silent [--dir X] [--no-launch] [--no-autostart]`
-* `Uninstall.exe --silent --uninstall [--delete-settings]`
+* `Uninstall.exe --uninstall [--dir X] [--delete-settings]` — both `--` and `/`
+  forms are accepted, because that is how launchers rewrite it.
 
 Settings are stored in `%APPDATA%\NeedleVoice\config.toml`, and the log is
 `agent.log` in the same folder. The agent restarts itself when settings change.
@@ -188,7 +197,9 @@ crates/nv-agent   audio, VAD, Whisper, keyword spotter, listener state
                   machine, alarm scheduler, bubble overlay, tray, neural TTS
                   playback
 crates/nv-config  settings UI (egui)
-crates/nv-setup   installer/uninstaller with embedded zstd payload
+crates/nv-setup   installer with embedded zstd payload — installs only
+crates/nv-uninstall  uninstaller, a separate small program (see docs/installer.md)
+crates/nv-version shared Windows version resources, icon and manifest
 ```
 
 ## Licence

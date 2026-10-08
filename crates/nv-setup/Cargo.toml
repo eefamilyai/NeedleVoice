@@ -12,10 +12,10 @@ path = "src/main.rs"
 nv-core = { path = "../nv-core" }
 eframe = { version = "0.36", default-features = false, features = ["default_fonts", "glow"] }
 tar = "0.4"
-windows = { version = "0.62", features = ["Win32_UI_Shell"] }
+windows = { version = "0.62", features = ["Win32_UI_Shell", "Win32_Storage_FileSystem"] }
 zstd = "0.14"
 
 [build-dependencies]
-winresource = "0.1"
+nv-version = { path = "../nv-version" }
 tar = "0.4"
 zstd = { version = "0.14", features = ["zstdmt"] }

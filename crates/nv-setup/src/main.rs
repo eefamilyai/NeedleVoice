@@ -1,4 +1,9 @@
-//! NeedleVoice installer / uninstaller. Per-user install, no admin needed.
+//! NeedleVoice installer. Per-user install, no admin needed.
+//!
+//! Installing is all this program does. Removing an installation is the
+//! uninstaller's job, and that is a program of its own under `crates/nv-uninstall`
+//! — see `docs/installer.md` for why it must not be this file under another
+//! name, which is what it used to be.
 #![windows_subsystem = "windows"]
 
 use std::io::Read;
@@ -6,10 +11,31 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use eframe::egui::{self, Color32, RichText, Stroke};
-use nv_core::{paths, win, Config};
+use nv_core::{win, Config};
 
 static PAYLOAD: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/payload.tar.zst"));
 const ACCENT: Color32 = Color32::from_rgb(182, 255, 46);
+
+/// Name the uninstaller travels under inside the payload. It is written into the
+/// install folder as `Uninstall.exe`, which is the name Add/Remove Programs and
+/// the shortcut both expect.
+const UNINSTALLER_IN_PAYLOAD: &str = "NeedleVoiceUninstall.exe";
+
+/// A size a person can read, for the out-of-space message.
+fn human_size(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit + 1 < UNITS.len() {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
+}
 
 #[derive(Clone, PartialEq)]
 enum Stage {
@@ -27,30 +53,26 @@ struct Progress {
 }
 
 struct Setup {
-    uninstall: bool,
     stage: Stage,
     dir: String,
     name: String,
     autostart: bool,
     desktop: bool,
     launch: bool,
-    delete_settings: bool,
     progress: Arc<Mutex<Progress>>,
 }
 
 impl Setup {
-    fn new(uninstall: bool) -> Self {
+    fn new() -> Self {
         let existing = Config::load();
-        let dir = win::installed_location().unwrap_or_else(paths::default_install_dir);
+        let dir = win::installed_location().unwrap_or_else(nv_core::paths::default_install_dir);
         Self {
-            uninstall,
             stage: Stage::Welcome,
             dir: dir.display().to_string(),
             name: existing.agent_name.clone(),
             autostart: true,
             desktop: true,
             launch: true,
-            delete_settings: false,
             progress: Default::default(),
         }
     }
@@ -60,8 +82,8 @@ impl Setup {
         let p = self.progress.clone();
         let ctx = ctx.clone();
         let dir = PathBuf::from(self.dir.trim());
-        let (name, autostart, desktop, launch, uninstall, delete_settings) =
-            (self.name.trim().to_string(), self.autostart, self.desktop, self.launch, self.uninstall, self.delete_settings);
+        let (name, autostart, desktop, launch) =
+            (self.name.trim().to_string(), self.autostart, self.desktop, self.launch);
         std::thread::spawn(move || {
             win::com_init();
             let report = |f: f32, s: &str| {
@@ -70,11 +92,7 @@ impl Setup {
                 g.step = s.to_string();
                 ctx.request_repaint();
             };
-            let r = if uninstall {
-                do_uninstall(&dir, delete_settings, &report)
-            } else {
-                do_install(&dir, &name, autostart, desktop, launch, &report)
-            };
+            let r = do_install(&dir, &name, autostart, desktop, launch, &report);
             p.lock().unwrap().result = Some(r);
             ctx.request_repaint();
         });
@@ -82,19 +100,55 @@ impl Setup {
 }
 
 fn start_menu_dir() -> PathBuf {
-    use windows::Win32::UI::Shell::FOLDERID_Programs;
-    win::known_folder(&FOLDERID_Programs).unwrap_or_default().join("NeedleVoice")
+    win::start_menu_dir()
 }
 
 fn desktop_link() -> PathBuf {
-    use windows::Win32::UI::Shell::FOLDERID_Desktop;
-    win::known_folder(&FOLDERID_Desktop).unwrap_or_default().join("NeedleVoice Settings.lnk")
+    win::desktop_link()
 }
 
+/// Free space on the volume `dir` is (or would be) on. Asked before a single
+/// byte is written, so a machine without room is told so instead of being left
+/// with a half-copied installation.
+fn free_bytes(dir: &Path) -> Option<u64> {
+    let mut probe = dir;
+    while !probe.exists() {
+        probe = probe.parent()?;
+    }
+    let free = unsafe {
+        let mut available = 0u64;
+        windows::Win32::Storage::FileSystem::GetDiskFreeSpaceExW(
+            &windows::core::HSTRING::from(probe.as_os_str()),
+            Some(&mut available),
+            None,
+            None,
+        )
+        .ok()?;
+        available
+    };
+    Some(free)
+}
+
+/// Ask anything already running to close, before any file is laid down.
+///
+/// Not `taskkill`: an installer that reaches straight for force-termination is
+/// both worse for the user — the agent loses whatever it was doing — and one of
+/// the shapes a behaviour heuristic reads as hostile. Only a copy that ignores
+/// the request is terminated.
 fn stop_running() {
-    win::kill_by_exe(nv_core::AGENT_EXE);
-    win::kill_by_exe(nv_core::CONFIG_EXE);
-    std::thread::sleep(std::time::Duration::from_millis(400));
+    for exe in [nv_core::AGENT_EXE, nv_core::CONFIG_EXE] {
+        if !win::close_processes_named(exe, std::time::Duration::from_secs(5)) {
+            report_step(&format!("{exe} did not close and was stopped"));
+        }
+    }
+    std::thread::sleep(std::time::Duration::from_millis(300));
+}
+
+/// Progress notice from a place that has no reporter to hand (the steps that
+/// run before the worker thread owns one). Prints, so a silent install says
+/// what happened.
+fn report_step(line: &str) {
+    let _ = std::io::Write::write_all(&mut std::io::stdout(), format!("{line}\n").as_bytes());
 }
 
 /// Total size of a folder in bytes. The caller divides once, at the top: doing
@@ -117,7 +171,27 @@ fn dir_size_bytes(dir: &Path) -> u64 {
 fn do_install(dir: &Path, name: &str, autostart: bool, desktop: bool, launch: bool, report: &dyn Fn(f32, &str)) -> Result<(), String> {
     report(0.02, "Closing any running copy…");
     stop_running();
+
+    // Room for the payload before anything is written. The archive is
+    // compressed, so this is only a guide, but it turns "the install failed
+    // half way with a disk-full error" into a plain message up front.
+    if let Some(free) = free_bytes(dir) {
+        if free < PAYLOAD.len() as u64 {
+            return Err(format!(
+                "Not enough space on that drive: {} is free and the install needs about {}.",
+                human_size(free),
+                human_size(PAYLOAD.len() as u64)
+            ));
+        }
+    }
     std::fs::create_dir_all(dir).map_err(|e| format!("Can't create {}: {e}", dir.display()))?;
+
+    // The uninstaller that is about to be laid down is a separate program in
+    // the payload. An older install left the *installer* here under this name,
+    // and it has to go before the new one can be written — as well as being the
+    // file that was being flagged, so removing it is the point.
+    let uninst = dir.join(nv_core::UNINSTALL_EXE);
+    let _ = std::fs::remove_file(&uninst);
 
     // Extract the payload, reporting progress by compressed bytes consumed.
     struct Counting<'a> {
@@ -169,12 +243,16 @@ fn do_install(dir: &Path, name: &str, autostart: bool, desktop: bool, launch: bo
     report(0.88, "Creating shortcuts…");
     let agent = dir.join(nv_core::AGENT_EXE);
     let config_exe = dir.join(nv_core::CONFIG_EXE);
-    let uninst = dir.join(nv_core::UNINSTALL_EXE);
-    if let Ok(me) = std::env::current_exe() {
-        if me != uninst {
-            std::fs::copy(&me, &uninst).map_err(|e| format!("Couldn't write uninstaller: {e}"))?;
-        }
+    // Written under the name Add/Remove Programs expects, from the program the
+    // payload carried — which is where the old build copied *itself*.
+    let shipped = dir.join(UNINSTALLER_IN_PAYLOAD);
+    if !shipped.exists() {
+        return Err(format!(
+            "The payload is missing {UNINSTALLER_IN_PAYLOAD}, so there would be no way to uninstall. \
+             Rebuild the installer."
+        ));
     }
+    std::fs::copy(&shipped, &uninst).map_err(|e| format!("Couldn't write the uninstaller: {e}"))?;
     let sm = start_menu_dir();
     win::create_shortcut(&sm.join("NeedleVoice.lnk"), &agent, "", "Start the NeedleVoice assistant")?;
     win::create_shortcut(&sm.join("NeedleVoice Settings.lnk"), &config_exe, "", "NeedleVoice settings")?;
@@ -201,34 +279,29 @@ fn do_install(dir: &Path, name: &str, autostart: bool, desktop: bool, launch: bo
     Ok(())
 }
 
+/// Uninstalling is not this program's job any more.
+///
+/// Handing the request to the installed uninstaller is both the ordinary way a
+/// setup program behaves — "uninstall" from the installer just runs the
+/// uninstaller — and the reason this file no longer has to contain an
+/// uninstaller's routines. See `docs/installer.md`.
 fn do_uninstall(dir: &Path, delete_settings: bool, report: &dyn Fn(f32, &str)) -> Result<(), String> {
-    report(0.1, "Stopping the assistant…");
-    stop_running();
-    report(0.3, "Removing shortcuts…");
-    let _ = win::set_autostart(false, Path::new(""));
-    let _ = std::fs::remove_dir_all(start_menu_dir());
-    let _ = std::fs::remove_file(desktop_link());
-    win::unregister_uninstaller();
+    let uninst = dir.join(nv_core::UNINSTALL_EXE);
+    if !uninst.exists() {
+        return Err(format!(
+            "{} is not there, so there is nothing installed to remove. \
+             Use Apps & features, or delete {} by hand.",
+            uninst.display(),
+            dir.display()
+        ));
+    }
+    report(0.3, "Handing over to the uninstaller…");
+    let mut args: Vec<String> = vec!["--uninstall".into(), "--dir".into(), dir.display().to_string()];
     if delete_settings {
-        let _ = std::fs::remove_dir_all(paths::data_dir());
+        args.push("--delete-settings".into());
     }
-    report(0.6, "Removing files…");
-    // Delete everything except ourselves (we're probably Uninstall.exe in that folder).
-    let me = std::env::current_exe().ok();
-    if let Ok(rd) = std::fs::read_dir(dir) {
-        for e in rd.flatten() {
-            let p = e.path();
-            if Some(&p) == me.as_ref() {
-                continue;
-            }
-            let _ = if p.is_dir() { std::fs::remove_dir_all(&p) } else { std::fs::remove_file(&p) };
-        }
-    }
-    // Remove the folder (and this exe) once we've exited.
-    use std::os::windows::process::CommandExt;
-    let script = format!("ping 127.0.0.1 -n 3 > nul & rmdir /s /q \"{}\"", dir.display());
-    // raw_arg: Rust's quoting (\") confuses cmd.exe.
-    let _ = std::process::Command::new("cmd").raw_arg(format!("/C {script}")).creation_flags(0x0800_0000).spawn();
+    let borrowed: Vec<&str> = args.iter().map(String::as_str).collect();
+    win::spawn_detached(&uninst, &borrowed).map_err(|e| format!("Couldn't start the uninstaller: {e}"))?;
     report(1.0, "Done");
     Ok(())
 }
@@ -269,22 +342,11 @@ impl eframe::App for Setup {
                 let (rect, _) = ui.allocate_exact_size(egui::vec2(120.0, 110.0), egui::Sense::hover());
                 orb(ui, rect.center(), 36.0, t);
                 ui.label(RichText::new("NeedleVoice").size(28.0).strong());
-                let sub = if self.uninstall { "Uninstall" } else { "Your voice assistant, powered by Needle 3" };
-                ui.label(RichText::new(sub).color(Color32::from_gray(160)));
+                ui.label(RichText::new("Your voice assistant, powered by Needle 3").color(Color32::from_gray(160)));
                 ui.add_space(14.0);
             });
 
             match self.stage.clone() {
-                Stage::Welcome if self.uninstall => {
-                    ui.label("This removes NeedleVoice, its shortcuts and auto-start from this PC.");
-                    ui.checkbox(&mut self.delete_settings, "Also delete my settings");
-                    ui.add_space(16.0);
-                    ui.vertical_centered(|ui| {
-                        if ui.add(big_button("Uninstall")).clicked() {
-                            self.start(&ctx);
-                        }
-                    });
-                }
                 Stage::Welcome => {
                     egui::Grid::new("opts").num_columns(2).spacing([12.0, 10.0]).show(ui, |ui| {
                         ui.label("Name your assistant");
@@ -318,38 +380,32 @@ impl eframe::App for Setup {
                 }
                 Stage::Done => {
                     ui.vertical_centered(|ui| {
-                        if self.uninstall {
-                            ui.label(RichText::new("NeedleVoice has been removed.").size(16.0));
-                        } else {
-                            ui.label(RichText::new("All set!").size(20.0).strong().color(ACCENT));
-                            ui.add_space(6.0);
-                            ui.label(format!("Try saying \"Hey {}, open Chrome\"", self.name.trim()));
-                            ui.label(format!("or \"Hey {}, what is the Haber process?\"", self.name.trim()));
-                            ui.add_space(6.0);
-                            ui.label(RichText::new("Find it in the system tray. Change the voice, colour and more in NeedleVoice Settings.").small().color(Color32::from_gray(150)));
-                            ui.add_space(10.0);
-                            if ui.button("Open Settings").clicked() {
-                                let exe = PathBuf::from(self.dir.trim()).join(nv_core::CONFIG_EXE);
-                                let _ = win::spawn_detached(&exe, &[]);
-                            }
+                        ui.label(RichText::new("All set!").size(20.0).strong().color(ACCENT));
+                        ui.add_space(6.0);
+                        ui.label(format!("Try saying \"Hey {}, open Chrome\"", self.name.trim()));
+                        ui.label(format!("or \"Hey {}, what is the Haber process?\"", self.name.trim()));
+                        ui.add_space(6.0);
+                        ui.label(RichText::new("Find it in the system tray. Change the voice, colour and more in NeedleVoice Settings.").small().color(Color32::from_gray(150)));
+                        ui.add_space(10.0);
+                        if ui.button("Open Settings").clicked() {
+                            let exe = PathBuf::from(self.dir.trim()).join(nv_core::CONFIG_EXE);
+                            let _ = win::spawn_detached(&exe, &[]);
                         }
                         ui.add_space(8.0);
                         if ui.add(big_button("Finish")).clicked() {
                             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                         }
-                        if !self.uninstall {
-                            ui.add_space(10.0);
-                            ui.label(
-                                RichText::new("Tool calling by Needle 3 — Cactus Compute, Inc. (Apache-2.0)")
-                                    .small()
-                                    .color(Color32::from_gray(120)),
-                            );
-                            ui.label(
-                                RichText::new("Speech by whisper.cpp and sherpa-onnx · voices by Piper and Kokoro")
-                                    .small()
-                                    .color(Color32::from_gray(120)),
-                            );
-                        }
+                        ui.add_space(10.0);
+                        ui.label(
+                            RichText::new("Tool calling by Needle 3 — Cactus Compute, Inc. (Apache-2.0)")
+                                .small()
+                                .color(Color32::from_gray(120)),
+                        );
+                        ui.label(
+                            RichText::new("Speech by whisper.cpp and sherpa-onnx · voices by Piper and Kokoro")
+                                .small()
+                                .color(Color32::from_gray(120)),
+                        );
                     });
                 }
                 Stage::Failed(e) => {
@@ -372,15 +428,40 @@ fn big_button(text: &str) -> egui::Button<'static> {
         .corner_radius(8.0)
 }
 
+/// Relay an uninstall to the program that is installed to do it.
+///
+/// Setup used to *be* the uninstaller, which is what put a copy of this file in
+/// the install folder. Now it just hands over — the ordinary division of labour,
+/// and the reason this executable has no uninstall code in it.
+fn relay_uninstall(args: &[String]) -> i32 {
+    win::com_init();
+    let dir = args
+        .iter()
+        .position(|a| a == "--dir")
+        .and_then(|i| args.get(i + 1))
+        .map(PathBuf::from)
+        .or_else(win::installed_location)
+        .unwrap_or_else(nv_core::paths::default_install_dir);
+    let quiet = |_: f32, _: &str| {};
+    let delete_settings = args.iter().any(|a| a == "--delete-settings");
+    match do_uninstall(&dir, delete_settings, &quiet) {
+        Ok(()) => 0,
+        Err(e) => {
+            report_step(&e);
+            1
+        }
+    }
+}
+
 fn main() -> eframe::Result {
-    let uninstall = std::env::args().any(|a| a == "--uninstall")
-        || std::env::current_exe()
-            .ok()
-            .and_then(|p| p.file_name().map(|n| n.to_string_lossy().eq_ignore_ascii_case(nv_core::UNINSTALL_EXE)))
-            .unwrap_or(false);
-    // Headless: `--silent [--dir <path>] [--no-launch] [--no-autostart]`.
     let args: Vec<String> = std::env::args().collect();
-    if args.iter().any(|a| a == "--silent") {
+    let uninstall = args.iter().any(|a| a == "--uninstall" || a == "/uninstall");
+
+    // Headless: `--silent [--dir <path>] [--no-launch] [--no-autostart]`.
+    if args.iter().any(|a| a == "--silent") || uninstall {
+        if uninstall {
+            std::process::exit(relay_uninstall(&args));
+        }
         win::com_init();
         let dir = args
             .iter()
@@ -388,22 +469,18 @@ fn main() -> eframe::Result {
             .and_then(|i| args.get(i + 1))
             .map(PathBuf::from)
             .or_else(win::installed_location)
-            .unwrap_or_else(paths::default_install_dir);
+            .unwrap_or_else(nv_core::paths::default_install_dir);
         let quiet = |_: f32, _: &str| {};
-        let r = if uninstall {
-            do_uninstall(&dir, args.iter().any(|a| a == "--delete-settings"), &quiet)
-        } else {
-            let name = Config::load().agent_name;
-            let autostart = !args.iter().any(|a| a == "--no-autostart");
-            let launch = !args.iter().any(|a| a == "--no-launch");
-            do_install(&dir, &name, autostart, false, launch, &quiet)
-        };
+        let name = Config::load().agent_name;
+        let autostart = !args.iter().any(|a| a == "--no-autostart");
+        let launch = !args.iter().any(|a| a == "--no-launch");
+        let r = do_install(&dir, &name, autostart, false, launch, &quiet);
         std::process::exit(if r.is_ok() { 0 } else { 1 });
     }
 
     let opts = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title(if uninstall { "Uninstall NeedleVoice" } else { "NeedleVoice Setup" })
+            .with_title("NeedleVoice Setup")
             .with_inner_size([560.0, 520.0])
             .with_resizable(false),
         ..Default::default()
@@ -417,7 +494,7 @@ fn main() -> eframe::Result {
             v.selection.bg_fill = ACCENT.linear_multiply(0.4);
             v.selection.stroke = Stroke::new(1.0, ACCENT);
             cc.egui_ctx.set_visuals(v);
-            Ok(Box::new(Setup::new(uninstall)))
+            Ok(Box::new(Setup::new()))
         }),
     )
 }

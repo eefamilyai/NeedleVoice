@@ -263,6 +263,22 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             check_config();
             LRESULT(0)
         }
+        // Closing the window means "stop". The installer and the settings app
+        // both use that instead of terminating the process: it lets the
+        // listener stop the microphone and the voice release the speakers
+        // first. Without these two arms the agent could not be asked to quit at
+        // all — the message loop has no other way out.
+        WM_CLOSE => {
+            if let Some(t) = tray() {
+                let _ = t.ctl.send(Ctl::Quit);
+            }
+            unsafe { PostQuitMessage(0) };
+            LRESULT(0)
+        }
+        WM_DESTROY => {
+            unsafe { PostQuitMessage(0) };
+            LRESULT(0)
+        }
         WM_ENDSESSION => {
             remove_icon();
             LRESULT(0)

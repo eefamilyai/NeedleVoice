@@ -143,6 +143,22 @@ fn main() {
         return;
     }
 
+    // `--bench-needle "<command>" [depth] [max_tokens]…`: where the time goes.
+    // Runs the real prompt through the real engine. One run with a token budget of
+    // 1 measures the prompt pass on its own, so a second run at the real budget
+    // separates prefill from decoding.
+    if args.iter().any(|a| a == "--bench-needle") {
+        let rest: Vec<&String> = args.iter().skip_while(|a| *a != "--bench-needle").skip(1).collect();
+        let Some(command) = rest.first() else {
+            eprintln!("usage: --bench-needle \"<command>\" [depth] [max_tokens]");
+            return;
+        };
+        let depth: usize = rest.get(1).and_then(|s| s.parse().ok()).unwrap_or(20);
+        let budget: usize = rest.get(2).and_then(|s| s.parse().ok()).unwrap_or(160);
+        print!("{}", nv_core::brain::bench_needle(command, depth, budget));
+        return;
+    }
+
     // `--bench-live <model> <clip.wav>…`: what a caption would show, and when.
     // Prints the partial text every half second while feeding the clip in real
     // time, which is the only way to judge a streaming model for a caption.

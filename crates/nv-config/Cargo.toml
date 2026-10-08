@@ -16,4 +16,4 @@ cpal = "0.18"
 log = "0.4"
 
 [build-dependencies]
-winresource = "0.1"
+nv-version = { path = "../nv-version" }

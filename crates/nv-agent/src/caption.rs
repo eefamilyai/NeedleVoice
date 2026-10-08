@@ -15,14 +15,14 @@ use std::sync::OnceLock;
 use windows::core::w;
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    CreateCompatibleDC, CreateDIBSection, CreateFontW, DeleteDC, DeleteObject, DrawTextW, GetDC, ReleaseDC,
+    CreateCompatibleDC, CreateDIBSection, CreateFontW, DeleteObject, DrawTextW, GetDC, ReleaseDC,
     SelectObject, SetBkMode, SetTextColor, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, BLENDFUNCTION, CLEARTYPE_QUALITY,
     DIB_RGB_COLORS, DT_CENTER, DT_END_ELLIPSIS, DT_SINGLELINE, DT_VCENTER, FW_SEMIBOLD, HDC, HGDIOBJ, TRANSPARENT,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::{GetDpiForSystem, GetDpiForWindow};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, GetSystemMetrics, PostMessageW, RegisterClassW, ShowWindow,
+    CreateWindowExW, DefWindowProcW, GetSystemMetrics, RegisterClassW, ShowWindow,
     UpdateLayeredWindow, SW_HIDE, SW_SHOWNOACTIVATE, SM_CXSCREEN, SM_CYSCREEN, ULW_ALPHA, WNDCLASSW, WS_EX_LAYERED,
     WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
 };
@@ -290,8 +290,6 @@ fn dpi_scale() -> f32 {
     }
 }
 
-/// The caption thread runs for the life of the process; there is nothing to tear
-/// down that the operating system does not reclaim.
-pub fn destroy() {
-    set("");
-}
+// The caption window lives for the life of the process; the operating system
+// reclaims everything it holds, so there is nothing to tear down. An earlier
+// `destroy()` here did nothing but clear the text, and nothing called it.

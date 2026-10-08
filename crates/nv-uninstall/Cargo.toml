@@ -1,0 +1,22 @@
+[package]
+name = "nv-uninstall"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# Named like the rest of the product rather than something opaque: an
+# uninstaller whose file name means nothing is one of the shapes malware uses
+# to hide. The installer copies this, unrenamed, to `Uninstall.exe`.
+[[bin]]
+name = "NeedleVoiceUninstall"
+path = "src/main.rs"
+
+[dependencies]
+nv-core = { path = "../nv-core" }
+# No Windows bindings of its own: the handful of shell calls it needs — the
+# folder ids, the registry, asking the agent to close — come from `nv-core::win`,
+# so this crate stays small. Add nothing here lightly; the size and the shape of
+# this binary are the point.
+
+[build-dependencies]
+nv-version = { path = "../nv-version" }

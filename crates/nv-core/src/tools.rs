@@ -621,6 +621,76 @@ pub fn tools_json(cfg: &Config) -> String {
     Value::Array(tools).to_string()
 }
 
+/// The tool list handed to Needle, cut down to what could plausibly matter for
+/// this command.
+///
+/// Every command used to be preceded by the same 5 KB of tool definitions, and
+/// the model reads prompts at about 15 ms per token on this class of CPU: 1,149
+/// positions of tool description cost 17 of the 18.4 seconds a command took,
+/// while decoding the answer cost 1.4. So the definitions are the latency, and
+/// they are mostly irrelevant to any one command.
+///
+/// A phrase hit is decisive; otherwise the command's words are matched against
+/// each tool's name and description. When nothing scores, or the best score is
+/// weak, the full list goes instead — a slow right answer beats a fast wrong one.
+/// `brain::ask_needle` also retries with the full list when a short list leads
+/// nowhere.
+pub fn tools_json_for(cfg: &Config, command: &str) -> (String, bool) {
+    const KEEP: usize = 8;
+    let words: Vec<String> = command
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| w.len() > 2)
+        .map(|w| w.to_lowercase())
+        .collect();
+
+    let mut scored: Vec<(i32, Value)> = Vec::new();
+    let mut best = 0i32;
+    for t in enabled_builtins(cfg) {
+        let mut score = 0i32;
+        // An exact phrase match is the strongest signal there is.
+        if t.phrases.iter().any(|p| match_phrase(p, command).is_some()) {
+            score += 1000;
+        }
+        let name = t.name.to_lowercase();
+        for w in &words {
+            if name.contains(w.as_str()) || w.contains(name.split('_').next().unwrap_or("")) && name.len() > 4 {
+                score += 40;
+            }
+            if t.description.to_lowercase().contains(w.as_str()) {
+                score += 8;
+            }
+        }
+        if score > 0 {
+            best = best.max(score);
+            let params: Vec<(String, String)> = t.params.iter().map(|(p, d)| (p.to_string(), d.to_string())).collect();
+            scored.push((score, tool_json(t.name, t.description, &params)));
+        }
+    }
+    for c in cfg.custom_tools.iter().filter(|c| c.enabled && !c.name.is_empty()) {
+        let mut score = 0i32;
+        for w in &words {
+            if c.name.to_lowercase().contains(w.as_str()) || c.description.to_lowercase().contains(w.as_str()) {
+                score += 40;
+            }
+        }
+        if score > 0 {
+            best = best.max(score);
+            let params: Vec<(String, String)> = c.params.iter().map(|p| (p.clone(), String::new())).collect();
+            scored.push((score, tool_json(&c.name, &c.description, &params)));
+        }
+    }
+
+    // A weak match is no match: the command is unlike anything in the list, so
+    // hand the model everything rather than guess at a shortlist.
+    if scored.is_empty() || best < 40 {
+        return (tools_json(cfg), false);
+    }
+    scored.sort_by(|a, b| b.0.cmp(&a.0));
+    scored.truncate(KEEP);
+    let short: Vec<Value> = scored.into_iter().map(|(_, v)| v).collect();
+    (Value::Array(short).to_string(), true)
+}
+
 /// Match a spoken command against a phrase pattern with `{param}` slots.
 /// Returns the captured values when it matches.
 pub fn match_phrase(pattern: &str, text: &str) -> Option<Vec<(String, String)>> {
@@ -917,5 +987,38 @@ mod tests {
                 assert!(t.example.contains(&format!("{{{p}}}")) || !t.phrases.is_empty(), "{}: unusable example", t.name);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod shortlist_tests {
+    use super::*;
+    use crate::Config;
+
+    fn names(json: &str) -> Vec<String> {
+        serde_json::from_str::<Value>(json)
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|t| t.get("name").and_then(|n| n.as_str()).map(String::from))
+            .collect()
+    }
+
+    #[test]
+    fn a_shortlist_keeps_the_tool_the_command_needs() {
+        let cfg = Config::default();
+        let (json, short) = tools_json_for(&cfg, "close all the file explorers");
+        assert!(short, "an app command should shortlist");
+        assert!(names(&json).iter().any(|n| n == "close_app" || n == "open_app"), "{:?}", names(&json));
+        assert!(json.len() * 3 < tools_json(&cfg).len(), "the shortlist should be far smaller");
+    }
+
+    #[test]
+    fn an_unrecognisable_command_still_gets_everything() {
+        let cfg = Config::default();
+        let (json, short) = tools_json_for(&cfg, "qwertyuiop zxcvbnm");
+        assert!(!short, "nothing matched, so nothing should be left out");
+        assert_eq!(json, tools_json(&cfg));
     }
 }

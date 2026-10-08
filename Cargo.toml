@@ -1,6 +1,13 @@
 [workspace]
 resolver = "2"
-members = ["crates/nv-core", "crates/nv-agent", "crates/nv-config", "crates/nv-setup"]
+members = [
+    "crates/nv-core",
+    "crates/nv-agent",
+    "crates/nv-config",
+    "crates/nv-setup",
+    "crates/nv-uninstall",
+    "crates/nv-version",
+]
 
 [workspace.package]
 version = "0.1.0"

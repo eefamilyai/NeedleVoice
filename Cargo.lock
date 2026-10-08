@@ -1839,12 +1839,12 @@ dependencies = [
  "cpal",
  "log",
  "nv-core",
+ "nv-version",
  "sherpa-onnx",
  "tiny-skia",
  "webrtc-vad",
  "whisper-rs",
  "windows",
- "winresource",
 ]
 
 [[package]]
@@ -1856,7 +1856,7 @@ dependencies = [
  "egui_extras",
  "log",
  "nv-core",
- "winresource",
+ "nv-version",
 ]
 
 [[package]]
@@ -1882,10 +1882,25 @@ version = "0.1.0"
 dependencies = [
  "eframe",
  "nv-core",
+ "nv-version",
  "tar",
  "windows",
- "winresource",
  "zstd 0.14.0",
+]
+
+[[package]]
+name = "nv-uninstall"
+version = "0.1.0"
+dependencies = [
+ "nv-core",
+ "nv-version",
+]
+
+[[package]]
+name = "nv-version"
+version = "0.1.0"
+dependencies = [
+ "winresource",
 ]
 
 [[package]]

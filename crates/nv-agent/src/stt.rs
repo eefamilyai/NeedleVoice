@@ -187,10 +187,6 @@ impl Stt {
         }
     }
 
-    pub fn backend(&self) -> Backend {
-        self.backend
-    }
-
     /// Which engine this instance actually ended up with.
     pub fn engine(&self) -> &'static str {
         self.backend.name()

@@ -226,6 +226,20 @@ pub fn installed_location() -> Option<PathBuf> {
     reg_get_string(HKEY_CURRENT_USER, UNINSTALL_KEY, Some("InstallLocation")).map(PathBuf::from)
 }
 
+/// The Start-menu folder every shortcut for this product lives in. Both the
+/// installer and the uninstaller ask for it here, so the two cannot drift
+/// apart and leave shortcuts behind.
+pub fn start_menu_dir() -> PathBuf {
+    use windows::Win32::UI::Shell::FOLDERID_Programs;
+    known_folder(&FOLDERID_Programs).unwrap_or_default().join(crate::PRODUCT)
+}
+
+/// The desktop shortcut, if the install made one.
+pub fn desktop_link() -> PathBuf {
+    use windows::Win32::UI::Shell::FOLDERID_Desktop;
+    known_folder(&FOLDERID_Desktop).unwrap_or_default().join(format!("{} Settings.lnk", crate::PRODUCT))
+}
+
 /// Look up an executable registered under `App Paths` (e.g. `chrome.exe`).
 pub fn app_path(exe: &str) -> Option<PathBuf> {
     let key = format!(r"Software\Microsoft\Windows\CurrentVersion\App Paths\{exe}");
@@ -378,6 +392,78 @@ pub fn is_running(exe: &str) -> bool {
     processes().iter().any(|p| p.pid != me && p.exe.eq_ignore_ascii_case(exe))
 }
 
+/// Ask every process with this exe name to close, and wait for it to go.
+///
+/// Returns how many were running. `WM_CLOSE` first, and only after `grace` has
+/// passed without them leaving does anything get terminated. An installer that
+/// reaches straight for `taskkill` looks, from the outside, like something
+/// killing processes it has no business touching — and it also loses whatever
+/// the agent was doing. Returns `true` when nothing is left running.
+pub fn close_processes_named(exe: &str, grace: std::time::Duration) -> bool {
+    let me = std::process::id();
+    let targets: Vec<(u32, HWND)> = windows_of(exe).into_iter().filter(|(pid, _)| *pid != me).collect();
+    if targets.is_empty() {
+        // Nothing visible to ask; make sure there is nothing running either.
+        return !is_running(exe);
+    }
+    for (_, hwnd) in &targets {
+        unsafe {
+            let _ = PostMessageW(Some(*hwnd), WM_CLOSE, WPARAM(0), LPARAM(0));
+        }
+    }
+    let deadline = std::time::Instant::now() + grace;
+    while std::time::Instant::now() < deadline {
+        if !is_running(exe) {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    if !is_running(exe) {
+        return true;
+    }
+    // It did not close when asked. Terminate it rather than let the install
+    // fight over locked files.
+    kill_by_exe(exe);
+    for _ in 0..30 {
+        if !is_running(exe) {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    !is_running(exe)
+}
+
+/// Every top-level window belonging to a process with this exe name, with the
+/// process id that owns it. The window class is not needed: matching by the
+/// owner's image name covers the tray window and the message-only windows alike.
+fn windows_of(exe: &str) -> Vec<(u32, HWND)> {
+    let wanted: Vec<u32> = processes()
+        .into_iter()
+        .filter(|p| p.exe.eq_ignore_ascii_case(exe))
+        .map(|p| p.pid)
+        .collect();
+    if wanted.is_empty() {
+        return Vec::new();
+    }
+    let mut found: Vec<(u32, HWND)> = Vec::new();
+    let ptr = &mut found as *mut Vec<(u32, HWND)>;
+    unsafe {
+        let _ = EnumWindows(Some(collect_by_pid), LPARAM(ptr as isize));
+    }
+    found.retain(|(pid, _)| wanted.contains(pid));
+    found
+}
+
+unsafe extern "system" fn collect_by_pid(hwnd: HWND, lp: LPARAM) -> windows::core::BOOL {
+    let list = &mut *(lp.0 as *mut Vec<(u32, HWND)>);
+    let mut pid = 0u32;
+    GetWindowThreadProcessId(hwnd, Some(&mut pid));
+    if pid != 0 {
+        list.push((pid, hwnd));
+    }
+    true.into()
+}
+
 /// Hold a named mutex for the life of the process. Returns `None` when
 /// another process already owns it.
 pub struct SingleInstance(HANDLE);
@@ -418,6 +504,41 @@ pub fn spawn_hidden(exe: impl AsRef<OsStr>, args: &[&str]) -> std::io::Result<()
         .creation_flags(DETACHED_PROCESS | CREATE_NO_WINDOW)
         .spawn()
         .map(|_| ())
+}
+
+/// Run an already-built [`std::process::Command`] with no console window and no
+/// inheritance, so the parent can exit immediately without taking the child
+/// with it. Used by the uninstaller for its second half.
+pub fn spawn_detached_cmd(cmd: &mut std::process::Command) -> std::io::Result<()> {
+    use std::os::windows::process::CommandExt;
+    const DETACHED_PROCESS: u32 = 0x0000_0008;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    // Deliberately not CREATE_BREAKAWAY_FROM_JOB: it is only permitted when the
+    // caller is already in a job object that allows breakaway, and asking for it
+    // otherwise fails the whole call with ERROR_ACCESS_DENIED. DETACHED_PROCESS
+    // is what actually keeps the child alive past the parent's exit.
+    cmd.creation_flags(DETACHED_PROCESS | CREATE_NO_WINDOW).spawn().map(|_| ())
+}
+
+/// Is this process still running? Asking the kernel to wait on the handle with
+/// a zero timeout distinguishes "running" from "already gone" — a pid alone
+/// cannot, because pids are reused.
+pub fn process_alive(pid: u32) -> bool {
+    const SYNCHRONIZE: u32 = 0x0010_0000;
+    const WAIT_TIMEOUT: u32 = 0x0000_0102;
+    unsafe {
+        let Ok(h) = OpenProcess(
+            windows::Win32::System::Threading::PROCESS_ACCESS_RIGHTS(SYNCHRONIZE),
+            false,
+            pid,
+        ) else {
+            return false;
+        };
+        let r = windows::Win32::System::Threading::WaitForSingleObject(h, 0);
+        let _ = CloseHandle(h);
+        // WAIT_TIMEOUT means it did not signal: still running.
+        r == windows::Win32::Foundation::WAIT_EVENT(WAIT_TIMEOUT)
+    }
 }
 
 // ── Keyboard, media keys and volume ──────────────────────────────────────
