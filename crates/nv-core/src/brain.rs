@@ -337,6 +337,47 @@ impl Brain {
     }
 }
 
+/// `--bench-apps "<spoken>"…`: how the app matcher scores what was said, best
+/// first. The instant path only fires above a threshold, so the interesting
+/// question for any mis-heard name is what it scores and what it is competing
+/// with.
+pub fn bench_apps(spoken: &[String]) -> String {
+    let cfg = crate::Config::load();
+    let Some(index) = crate::apps::AppIndex::load_cache() else {
+        return "no app cache; run the agent once to scan".into();
+    };
+    let mut out = format!("{} apps indexed, {} with usage\n", index.apps.len(), index.usage.len());
+    for (name, uses) in index.usage.iter().take(5) {
+        out.push_str(&format!("   used {uses}x  {name}\n"));
+    }
+    for phrase in spoken {
+        let mut scored: Vec<(f64, &str)> = index
+            .apps
+            .iter()
+            .enumerate()
+            .map(|(i, a)| {
+                let s = match (index.normalized.get(i), index.squashed.get(i)) {
+                    (Some(n), Some(q)) => crate::fuzzy::app_score_prepared(phrase, n, q),
+                    _ => crate::fuzzy::app_score(phrase, &a.name),
+                };
+                (s, a.name.as_str())
+            })
+            .filter(|(s, _)| *s > 0.5)
+            .collect();
+        scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+        scored.truncate(4);
+        // What the instant path would decide, which is the question that matters:
+        // an instant answer costs nothing, and a wrong one costs trust.
+        let confident = index.find_confident(phrase, &cfg, 0.9, 0.10).map(|(a, s)| format!("{} ({s:.2})", a.name));
+        out.push_str(&format!("{phrase:>18} -> instant: {confident:?}\n"));
+        for (i, (s, name)) in scored.iter().enumerate() {
+            let lead = if i == 0 { String::new() } else { format!("  (lead {:+.3})", scored[0].0 - s) };
+            out.push_str(&format!("                      {s:.3}  {name}{lead}\n"));
+        }
+    }
+    out
+}
+
 /// `--bench-needle`: run the real prompt through the real engine and report where
 /// the milliseconds go. One pass with a one-token budget measures the prompt on
 /// its own, so a second pass at the real budget separates prefill from decoding —
@@ -871,11 +912,9 @@ fn instant(command: &str, cfg: &Config, apps: &AppIndex) -> Option<Vec<Action>> 
                 out.push(Action::OpenWebsite(part.to_string()));
                 continue;
             }
-            if let Some((app, score)) = apps.find(part, cfg) {
-                if score >= 0.9 {
-                    out.push(Action::OpenApp(app.name));
-                    continue;
-                }
+            if let Some((app, _)) = apps.find_confident(part, cfg, 0.9, 0.10) {
+                out.push(Action::OpenApp(app.name));
+                continue;
             }
             match known_site(part) {
                 Some(site) => out.push(Action::OpenWebsite(site.into())),
@@ -886,8 +925,10 @@ fn instant(command: &str, cfg: &Config, apps: &AppIndex) -> Option<Vec<Action>> 
     }
 
     if let Some(rest) = strip_prefix_word(&text, CLOSE_VERBS) {
-        let (app, score) = apps.find(rest, cfg)?;
-        return (score >= 0.88).then(|| vec![Action::CloseApp(app.name)]);
+        // Same evidence, a slightly lower bar: closing the wrong app is easier to
+        // undo than opening one that was never meant.
+        let (app, _) = apps.find_confident(rest, cfg, 0.88, 0.10)?;
+        return Some(vec![Action::CloseApp(app.name)]);
     }
 
     if let Some(rest) = strip_prefix_word(&text, &["go to", "visit", "navigate to"]) {

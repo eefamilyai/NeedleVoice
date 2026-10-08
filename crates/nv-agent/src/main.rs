@@ -143,6 +143,18 @@ fn main() {
         return;
     }
 
+    // `--bench-apps "<spoken>"…`: what the app matcher makes of a spoken name.
+    if args.iter().any(|a| a == "--bench-apps") {
+        let rest: Vec<String> = args
+            .iter()
+            .skip_while(|a| *a != "--bench-apps")
+            .skip(1)
+            .cloned()
+            .collect();
+        print!("{}", nv_core::brain::bench_apps(&rest));
+        return;
+    }
+
     // `--bench-needle "<command>" [depth] [max_tokens]…`: where the time goes.
     // Runs the real prompt through the real engine. One run with a token budget of
     // 1 measures the prompt pass on its own, so a second run at the real budget

@@ -57,6 +57,12 @@ pub struct AppIndex {
     pub normalized: Vec<String>,
     #[serde(skip)]
     pub squashed: Vec<String>,
+    /// How often each app has been opened, by name. A tie between two similar
+    /// names is broken by which one this person actually uses: "crow" scores
+    /// 0.775 against Chrome and 0.764 against a Visual Studio command prompt, and
+    /// nobody says "crow" for the command prompt.
+    #[serde(default)]
+    pub usage: std::collections::HashMap<String, u32>,
 }
 
 /// Entries that are never what someone means by "open X".
@@ -80,7 +86,23 @@ impl AppIndex {
     /// Load the cached list written by the last scan (fast, for startup).
     pub fn load_cache() -> Option<Self> {
         let text = std::fs::read_to_string(crate::paths::apps_cache_file()).ok()?;
-        serde_json::from_str::<Self>(&text).ok().map(AppIndex::reindex)
+        let mut index = serde_json::from_str::<Self>(&text).ok().map(AppIndex::reindex)?;
+        index.load_usage();
+        Some(index)
+    }
+
+    /// Read how often each app has been opened. Kept in its own small file, so
+    /// the app cache can be thrown away and rescanned without losing it.
+    pub fn load_usage(&mut self) {
+        if let Ok(text) = std::fs::read_to_string(crate::paths::data_dir().join("app-usage.json")) {
+            // A byte-order mark is rejected by the JSON parser, and Windows
+            // editors and PowerShell both like to write one.
+            let text = text.trim_start_matches('\u{feff}');
+            match serde_json::from_str::<std::collections::HashMap<String, u32>>(text) {
+                Ok(counts) => self.usage = counts,
+                Err(e) => log::warn!("app-usage.json did not parse ({e}); ignoring it"),
+            }
+        }
     }
 
     pub fn save_cache(&self) {
@@ -143,7 +165,9 @@ impl AppIndex {
 
         let mut apps: Vec<AppEntry> = by_name.into_values().filter(|a| !is_junk(&a.name)).collect();
         apps.sort_by_cached_key(|a| a.name.to_lowercase());
-        AppIndex { apps, ..Default::default() }.reindex()
+        let mut index = AppIndex { apps, ..Default::default() }.reindex();
+        index.load_usage();
+        index
     }
 
     /// An index over a known list of names, with the lookup tables built.
@@ -178,6 +202,93 @@ impl AppIndex {
             }
         }
         self.best_match(spoken, cfg)
+    }
+
+    /// Note that an app was opened, and keep it on disk for next time.
+    pub fn note_launch(&mut self, name: &str) {
+        if name.trim().is_empty() {
+            return;
+        }
+        *self.usage.entry(name.to_string()).or_insert(0) += 1;
+        let path = crate::paths::data_dir().join("app-usage.json");
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        if let Ok(json) = serde_json::to_string(&self.usage) {
+            let _ = std::fs::write(path, json);
+        }
+    }
+
+    /// How often this app has been opened.
+    pub fn uses(&self, name: &str) -> u32 {
+        self.usage.get(name).copied().unwrap_or(0)
+    }
+
+    /// A match strong enough to act on without the model.
+    ///
+    /// Two kinds of evidence count. A score over `min_score` is the ordinary one.
+    /// The other is a clear lead: "uni client" scores 0.77 against Lunar Client
+    /// while the whole rest of the list tops out at 0.65, so the right app is
+    /// not in doubt even though the words were mangled. A tie is never enough —
+    /// "crow" used to score 0.76 against two unrelated apps, which is exactly the
+    /// case that must go to the model.
+    pub fn find_confident(&self, spoken: &str, cfg: &Config, min_score: f64, min_margin: f64) -> Option<(AppEntry, f64)> {
+        // A dozen candidates, not two: a close call is decided by looking at
+        // everything within reach of the top, and Chrome for "crow" sits third.
+        let ranked = self.ranked(spoken, cfg, 12);
+        let (top, score) = ranked.first()?;
+        if *score >= min_score {
+            return Some((top.clone(), *score));
+        }
+        let runner_up = ranked.get(1).map(|(_, s)| *s).unwrap_or(0.0);
+        if *score >= 0.70 && *score - runner_up >= min_margin {
+            return Some((top.clone(), *score));
+        }
+        // Too close to call on the words alone. If one of the near-ties is an app
+        // this person actually opens, and the others are not, that settles it.
+        if *score >= 0.70 {
+            let near: Vec<&(AppEntry, f64)> = ranked.iter().filter(|(_, s)| *score - s <= 0.10).collect();
+            let mut by_use: Vec<(u32, &AppEntry)> = near.iter().map(|(a, _)| (self.uses(&a.name), a)).collect();
+            by_use.sort_by(|a, b| b.0.cmp(&a.0));
+            if let Some((best_uses, app)) = by_use.first() {
+                let next = by_use.get(1).map(|(u, _)| *u).unwrap_or(0);
+                if *best_uses >= 2 && *best_uses > next {
+                    return Some(((*app).clone(), *score));
+                }
+            }
+        }
+        None
+    }
+
+    /// The best `want` candidates, strongest first.
+    pub fn ranked(&self, spoken: &str, cfg: &Config, want: usize) -> Vec<(AppEntry, f64)> {
+        let excluded: Vec<String> = cfg.excluded_apps.iter().map(|e| fuzzy::normalize(e)).collect();
+        let mut scored: Vec<(AppEntry, f64)> = Vec::new();
+        for (i, app) in self.apps.iter().enumerate() {
+            let owned;
+            let (normal, squashed) = match (self.normalized.get(i), self.squashed.get(i)) {
+                (Some(n), Some(s)) => (n.as_str(), s.as_str()),
+                _ => {
+                    owned = (fuzzy::normalize(&app.name), fuzzy::squash(&app.name));
+                    (owned.0.as_str(), owned.1.as_str())
+                }
+            };
+            if excluded.iter().any(|e| e == normal) {
+                continue;
+            }
+            let s = fuzzy::app_score_prepared(spoken, normal, squashed);
+            if s >= 0.5 {
+                scored.push((app.clone(), s));
+            }
+        }
+        // Ties go to the shorter name: "Chrome" over "Chrome Remote Desktop".
+        scored.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.0.name.len().cmp(&b.0.name.len()))
+        });
+        scored.truncate(want);
+        scored
     }
 
     fn best_match(&self, spoken: &str, cfg: &Config) -> Option<(AppEntry, f64)> {
@@ -326,4 +437,50 @@ fn builtin_apps() -> Vec<AppEntry> {
         e("Sound Settings", "ms-settings:sound", None),
         e("Windows Update", "ms-settings:windowsupdate", None),
     ]
+}
+
+#[cfg(test)]
+mod confident_tests {
+    use super::*;
+    use crate::config::Config;
+
+    fn index(names: &[&str]) -> AppIndex {
+        AppIndex::from_names(names.iter().map(|n| AppEntry {
+            name: (*n).to_string(),
+            app_id: None,
+            path: None,
+            exe: None,
+        }))
+    }
+
+    #[test]
+    fn a_clear_lead_beats_a_high_bar() {
+        // "uni client" scores 0.77 against the right app and the rest of the list
+        // tops out well below it, so the words being mangled does not matter.
+        let idx = index(&["Lunar Client", "Disk Cleanup", "Quick Assist", "Snipping Tool"]);
+        let (app, score) = idx.find_confident("uni client", &Config::default(), 0.9, 0.10).expect("a match");
+        assert_eq!(app.name, "Lunar Client");
+        assert!(score < 0.9, "it is below the ordinary bar: {score}");
+    }
+
+    #[test]
+    fn a_coin_flip_is_settled_by_what_gets_used() {
+        let cfg = Config::default();
+        let mut idx = index(&["Google Chrome", "Comet"]);
+        // 0.855 against 0.854: nothing to choose between them on the words.
+        assert!(idx.find_confident("crome", &cfg, 0.9, 0.10).is_none());
+        idx.usage.insert("Google Chrome".into(), 14);
+        let (app, _) = idx.find_confident("crome", &cfg, 0.9, 0.10).expect("usage settles it");
+        assert_eq!(app.name, "Google Chrome");
+    }
+
+    #[test]
+    fn an_unrelated_command_is_still_left_alone() {
+        let mut idx = index(&["Google Chrome", "File Explorer", "Discord"]);
+        idx.usage.insert("Google Chrome".into(), 40);
+        let cfg = Config::default();
+        for junk in ["that thing", "qwertyuiop", "whatever"] {
+            assert!(idx.find_confident(junk, &cfg, 0.9, 0.10).is_none(), "{junk} should not match");
+        }
+    }
 }

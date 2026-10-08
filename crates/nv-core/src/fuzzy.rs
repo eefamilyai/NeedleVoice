@@ -99,9 +99,54 @@ fn score_prepared(q: &str, qs: &str, c: &str, cs: &str) -> f64 {
     // where the speaker used one distinctive word ("photoshop").
     if q_words.len() == 1 && qs.len() >= 4 {
         for w in c_words.iter() {
-            if w.len() >= 4 && plausible(qs, w) {
+            // A looser gate than `plausible`: one word against one word, where a
+            // clipped ending is normal ("crow" for Chrome is a third shorter) and
+            // the whole-string gate would refuse to even measure it.
+            if w.len() >= 4 && len_gate(qs, w, 0.45) {
                 best = best.max(strsim::jaro_winkler(qs, w) * 0.9);
             }
+            // A distinctive opening of the right word, with the ending clipped.
+            // Speech recognition drops the end of a word far more often than the
+            // start: "crow" for Chrome, "luna" for Lunar Client. Four characters
+            // minimum, and the name word must actually continue — "crow" is a
+            // prefix of "chrome", so this is evidence, not a guess.
+            let ws = squash(w);
+            if qs.len() >= 4 && ws.len() > qs.len() && ws.starts_with(qs) {
+                best = best.max(0.90 + 0.06 * (qs.len() as f64 / ws.len() as f64));
+            }
+        }
+    }
+
+    // Every word of the query finds a word of the name: "uni client" against
+    // "Lunar Client" is not close as a string, but word by word three of the
+    // four pieces line up. Each query word must match, so "all the file
+    // explorers" still fails — which is what keeps this from answering a
+    // command it does not understand.
+    if (2..=c_words.len()).contains(&q_words.len()) {
+        let mut total = 0.0;
+        let mut every = true;
+        for qw in &q_words {
+            let qws = squash(qw);
+            let wlen = qw.chars().count();
+            let mut wbest: f64 = 0.0;
+            for cw in &c_words {
+                let cws = squash(cw);
+                if qws == cws {
+                    wbest = wbest.max(1.0);
+                } else if wlen >= 3 && cws.starts_with(&qws) {
+                    wbest = wbest.max(0.92);
+                } else if wlen >= 4 && plausible(&qws, &cws) {
+                    wbest = wbest.max(strsim::jaro_winkler(&qws, &cws) * 0.95);
+                }
+            }
+            if wbest < 0.9 {
+                every = false;
+                break;
+            }
+            total += wbest;
+        }
+        if every {
+            best = best.max((total / q_words.len() as f64) * 0.94);
         }
     }
     best
@@ -113,9 +158,13 @@ fn score_prepared(q: &str, qs: &str, c: &str, cs: &str) -> f64 {
 /// the gate is looser than the 0.78 the caller asks for, so it never decides a
 /// match — it only skips work.
 fn plausible(a: &str, b: &str) -> bool {
-    const GATE: f64 = 0.30;
+    len_gate(a, b, 0.30)
+}
+
+/// Is a length difference small enough that a comparison could still pay off?
+fn len_gate(a: &str, b: &str, gate: f64) -> bool {
     let (long, short) = (a.len().max(b.len()), a.len().min(b.len()));
-    long == 0 || (long - short) as f64 / long as f64 <= GATE
+    long == 0 || (long - short) as f64 / long as f64 <= gate
 }
 
 /// Find `name` (possibly several words) near the start of `words`,
@@ -279,4 +328,28 @@ pub fn similarity(a: &str, b: &str) -> f64 {
         return 0.0;
     }
     1.0 - distance(&x, &y) as f64 / longest as f64
+}
+
+#[cfg(test)]
+mod crow_probe {
+    use super::*;
+
+    #[test]
+    fn what_does_crow_score() {
+        println!("crow / Google Chrome = {}", app_score("crow", "Google Chrome"));
+        println!("crow / Chrome        = {}", app_score("crow", "Chrome"));
+        println!("crow / Clock         = {}", app_score("crow", "Clock"));
+        println!("squash(crow)  = {:?}", squash("crow"));
+        println!("squash(chrome)= {:?}", squash("chrome"));
+        println!("words of 'Google Chrome' = {:?}", normalize("Google Chrome").split(' ').collect::<Vec<_>>());
+        println!("strip_filler(crow) = {:?}", strip_filler("crow"));
+        println!("normalize(Chrome)  = {:?}", normalize("Chrome"));
+        println!("score_prepared     = {}", score_prepared("crow", "crow", "chrome", "chrome"));
+        println!("app_score(cm/Chrome)= {}", app_score("cm", "Chrome"));
+        println!("compiled from      = {}", file!());
+        println!("'chrome'.starts_with('crow') = {}", "chrome".starts_with("crow"));
+        println!("jw(crow,chrome)    = {}", strsim::jaro_winkler("crow", "chrome"));
+        let n = score_prepared("crow", "crow", "chrome", "chrome");
+        println!("again score_prepared = {n}");
+    }
 }

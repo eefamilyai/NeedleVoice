@@ -728,6 +728,13 @@ fn handle_command(
         match actions::execute_with(&action, cfg, &index, speaker) {
             Ok(msg) => {
                 log::info!("  ✓ {msg}");
+                // Remember what was opened, so a mis-heard name can be settled by
+                // which app this person actually uses.
+                if let Action::OpenApp(name) = &action {
+                    if let Ok(mut idx) = apps.write() {
+                        idx.note_launch(name);
+                    }
+                }
                 outcomes.push(Outcome::Done(action, msg));
             }
             Err(e) => {
